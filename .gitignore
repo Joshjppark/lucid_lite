@@ -1,0 +1,17 @@
+# OS
+.DS_Store
+Thumbs.db
+uv.lock
+
+.claude/
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.py[codz]
+*.so
+
+# Other files
+*.slp
+
+
