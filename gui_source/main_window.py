@@ -12,12 +12,15 @@ from PySide6.QtWidgets import (
 )
 
 from assignment_panel import IdentityAssignmentPanel
+from playback_controls import PlaybackControls
 from pose_data import Session
 from timeline_widget import TimelineWidget
 from video_panel import VideoPanelWidget
 
 SIDEBAR_DEFAULT_WIDTH = 320
 SIDEBAR_MIN_WIDTH = 260
+TIMELINE_DEFAULT_HEIGHT = 200
+TIMELINE_MIN_HEIGHT = 60
 
 
 class LucidLiteWindow(QMainWindow):
@@ -74,8 +77,9 @@ class LucidLiteWindow(QMainWindow):
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 1)
 
-        timeline_container = QWidget(central)
+        timeline_container = QWidget()
         timeline_container.setObjectName("timeline_container")
+        timeline_container.setMinimumHeight(TIMELINE_MIN_HEIGHT)
         tl_row = QHBoxLayout(timeline_container)
         tl_row.setContentsMargins(0, 0, 0, 0)
         tl_row.setSpacing(0)
@@ -89,17 +93,49 @@ class LucidLiteWindow(QMainWindow):
         self.timeline_tabs.currentChanged.connect(self._on_timeline_tab_changed)
         self.session.color_mode_changed.connect(self._sync_timeline_tab)
 
+        # Playback controls (Prev / Play-Pause / Next) sit between the color
+        # tab bar and the timeline. They drive frame navigation through the
+        # main window's set_current_frame so all views stay in sync.
+        self.playback = PlaybackControls(
+            fps=self._effective_fps(),
+            parent=timeline_container,
+        )
+        self.playback.set_frame_range(self.session.min_frame, self.session.max_frame)
+        self.playback.set_current_frame(self._current_frame)
+        self.playback.frameSeekRequested.connect(self.set_current_frame)
+
         self.timeline = TimelineWidget(self.session, timeline_container)
         self.timeline.frameSeekRequested.connect(self.set_current_frame)
 
         tl_row.addWidget(self.timeline_tabs, stretch=0)
+        tl_row.addWidget(self.playback, stretch=0)
         tl_row.addWidget(self.timeline, stretch=1)
 
-        outer.addWidget(splitter, stretch=1)
-        outer.addWidget(timeline_container, stretch=0)
+        # Vertical splitter so the user can shrink/grow the timeline strip.
+        v_splitter = QSplitter(Qt.Vertical, central)
+        v_splitter.setObjectName("main_vsplit")
+        v_splitter.setChildrenCollapsible(False)
+        v_splitter.addWidget(splitter)
+        v_splitter.addWidget(timeline_container)
+        v_splitter.setStretchFactor(0, 1)
+        v_splitter.setStretchFactor(1, 0)
+        # Slim handle so the drag affordance is visible but unobtrusive.
+        v_splitter.setHandleWidth(6)
+
+        outer.addWidget(v_splitter, stretch=1)
 
         self.setCentralWidget(central)
         self._splitter = splitter
+        self._v_splitter = v_splitter
+
+    def _effective_fps(self) -> float:
+        """Pick the FPS to drive playback from. Falls back to 30 if no
+        decoder has reported an FPS yet."""
+        for panel in self._video_panels.values():
+            fps = getattr(panel, "fps", None)
+            if fps:
+                return float(fps)
+        return 30.0
 
     def _build_video_grid(self, grid: QGridLayout) -> None:
         cam_names = self.session.camera_names()
@@ -129,12 +165,16 @@ class LucidLiteWindow(QMainWindow):
         if screen is None:
             self.resize(1600, 1000)
             self._splitter.setSizes([1600 - SIDEBAR_DEFAULT_WIDTH, SIDEBAR_DEFAULT_WIDTH])
+            self._v_splitter.setSizes([1000 - TIMELINE_DEFAULT_HEIGHT, TIMELINE_DEFAULT_HEIGHT])
             return
         geom = screen.availableGeometry()
         self.resize(geom.size())
         self.move(geom.topLeft())
         target_left = max(0, geom.width() - SIDEBAR_DEFAULT_WIDTH)
         self._splitter.setSizes([target_left, SIDEBAR_DEFAULT_WIDTH])
+        top_h = max(TIMELINE_MIN_HEIGHT + 100,
+                    geom.height() - TIMELINE_DEFAULT_HEIGHT)
+        self._v_splitter.setSizes([top_h, TIMELINE_DEFAULT_HEIGHT])
 
     def _on_timeline_tab_changed(self, idx: int) -> None:
         self.session.set_color_mode("track" if idx == 0 else "identity")
@@ -178,6 +218,8 @@ class LucidLiteWindow(QMainWindow):
             panel.set_current_frame(frame_idx)
         self.timeline.set_current_frame(frame_idx)
         self.assignment.set_current_frame(frame_idx)
+        if hasattr(self, "playback"):
+            self.playback.set_current_frame(frame_idx)
         self.statusBar().showMessage(f"Frame {frame_idx}")
         self.currentFrameChanged.emit(frame_idx)
 
@@ -191,6 +233,8 @@ class LucidLiteWindow(QMainWindow):
             self.set_current_frame(self.session.min_frame)
         elif event.key() == Qt.Key_End:
             self.set_current_frame(self.session.max_frame)
+        elif event.key() == Qt.Key_Space:
+            self.playback.toggle_play()
         else:
             super().keyPressEvent(event)
 

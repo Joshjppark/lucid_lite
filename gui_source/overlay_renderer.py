@@ -11,6 +11,9 @@ from colors import get_identity_color, get_track_color
 from pose_data import FrameGroup, Instance, Session
 
 
+# Fallback defaults if a Session is unavailable. Live values come from
+# Session.node_size / Session.edge_width and are controlled by the sliders
+# in the Track/ID tab.
 NODE_RADIUS = 4
 EDGE_WIDTH = 2.0
 
@@ -26,7 +29,23 @@ def draw_overlay_for_camera(
     if frame_group is None or session.skeleton is None:
         return
 
+    node_radius = float(getattr(session, "node_size", NODE_RADIUS))
+    edge_width = float(getattr(session, "edge_width", EDGE_WIDTH))
+
     # Instances attached to this camera (linked via track_idx).
+    #
+    # Identity-mode color is resolved through `get_identity_id_for_track`
+    # (strict per-frame → global lookup). Note that the JS viewer uses
+    # `getGroupColor` which checks `group.identityId` first — that
+    # surfaces a real JS bug when the SLP file has stale `identity_idx`
+    # values saved into instance_groups: track_all updates the per-frame
+    # and global maps but does NOT clear `group.identityId`, so the
+    # viewer can still render duplicate identities at frames where the
+    # SLP had per-frame collisions baked in (eg. frame 149 midL on
+    # 10072022145420_small). Python doesn't reproduce that because our
+    # session_loader builds InstanceGroups fresh with identity_id=None.
+    # Fix applied in tracker.js is the wipe of group.identityId at the
+    # start of trackAll (see luc3d issue documented in commit msg).
     for inst in frame_group.get_instances(camera_name):
         ident_id = session.get_identity_id_for_track(
             current_frame_idx, camera_name, inst.track_idx
@@ -37,7 +56,8 @@ def draw_overlay_for_camera(
         else:
             color_hex = get_track_color(inst.track_idx)
         _draw_instance(painter, inst, session.skeleton, color_hex, video_to_panel,
-                       label=_instance_label(inst, ident))
+                       label=_instance_label(inst, ident),
+                       node_radius=node_radius, edge_width=edge_width)
 
     # Unlinked instances (no track yet) — rare in SLP imports but we draw them
     # so they remain visible if later added.
@@ -47,7 +67,8 @@ def draw_overlay_for_camera(
         else:
             color_hex = get_track_color(ul.instance.track_idx)
         _draw_instance(painter, ul.instance, session.skeleton, color_hex,
-                       video_to_panel, label="unlinked")
+                       video_to_panel, label="unlinked",
+                       node_radius=node_radius, edge_width=edge_width)
 
 
 def _instance_label(inst: Instance, ident) -> str:
@@ -59,9 +80,11 @@ def _instance_label(inst: Instance, ident) -> str:
 
 
 def _draw_instance(painter, inst: Instance, skeleton, color_hex: str,
-                   video_to_panel, label: str) -> None:
+                   video_to_panel, label: str,
+                   node_radius: float = NODE_RADIUS,
+                   edge_width: float = EDGE_WIDTH) -> None:
     color = QColor(color_hex)
-    pen = QPen(color, EDGE_WIDTH)
+    pen = QPen(color, edge_width)
     pen.setCapStyle(Qt.RoundCap)
     painter.setPen(pen)
 
@@ -79,9 +102,10 @@ def _draw_instance(painter, inst: Instance, skeleton, color_hex: str,
     # Nodes
     painter.setBrush(color)
     painter.setPen(QPen(QColor("#000000"), 1))
+    r = max(0.5, float(node_radius))
     for pp in pts_panel:
         if pp is not None:
-            painter.drawEllipse(pp, NODE_RADIUS, NODE_RADIUS)
+            painter.drawEllipse(pp, r, r)
 
     # Label at first visible node
     anchor = next((p for p in pts_panel if p is not None), None)

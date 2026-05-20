@@ -8,9 +8,9 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QButtonGroup, QComboBox, QDialog, QHBoxLayout, QLabel, QPushButton,
-    QRadioButton, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
-    QWidget,
+    QButtonGroup, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
+    QRadioButton, QSlider, QTableWidget, QTableWidgetItem, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
 from colors import get_track_color
@@ -88,6 +88,16 @@ class IdentityAssignmentPanel(QWidget):
         btn_row.addStretch()
         v.addLayout(btn_row)
 
+        track_row = QHBoxLayout()
+        self.track_frames_btn = QPushButton("Track Frames")
+        self.track_frames_btn.setToolTip(
+            "Run luc3d identity assignment on every frame of this session."
+        )
+        self.track_frames_btn.clicked.connect(self._track_frames)
+        track_row.addWidget(self.track_frames_btn)
+        track_row.addStretch()
+        v.addLayout(track_row)
+
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Color by:"))
         self.color_mode_track_btn = QRadioButton("Track")
@@ -102,6 +112,47 @@ class IdentityAssignmentPanel(QWidget):
         mode_row.addWidget(self.color_mode_id_btn)
         mode_row.addStretch()
         v.addLayout(mode_row)
+
+        # ---- skeleton appearance sliders (node radius + edge width) -----
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        v.addWidget(sep)
+
+        v.addWidget(QLabel("Skeleton appearance"))
+
+        node_row = QHBoxLayout()
+        node_row.addWidget(QLabel("Node size"))
+        self.node_size_slider = QSlider(Qt.Horizontal)
+        # Slider int range 1..40 maps to node radius 0.5..20.0 px (step 0.5).
+        self.node_size_slider.setRange(1, 40)
+        self.node_size_slider.setValue(int(round(self.session.node_size * 2)))
+        self.node_size_slider.setToolTip("Skeleton node circle radius (video px)")
+        self.node_size_value = QLabel(f"{self.session.node_size:.1f}")
+        self.node_size_value.setMinimumWidth(32)
+        self.node_size_slider.valueChanged.connect(self._on_node_size_changed)
+        node_row.addWidget(self.node_size_slider, stretch=1)
+        node_row.addWidget(self.node_size_value)
+        v.addLayout(node_row)
+
+        edge_row = QHBoxLayout()
+        edge_row.addWidget(QLabel("Edge width"))
+        self.edge_width_slider = QSlider(Qt.Horizontal)
+        # Slider int range 1..40 maps to edge width 0.5..20.0 px (step 0.5).
+        self.edge_width_slider.setRange(1, 40)
+        self.edge_width_slider.setValue(int(round(self.session.edge_width * 2)))
+        self.edge_width_slider.setToolTip("Skeleton edge stroke width (video px)")
+        self.edge_width_value = QLabel(f"{self.session.edge_width:.1f}")
+        self.edge_width_value.setMinimumWidth(32)
+        self.edge_width_slider.valueChanged.connect(self._on_edge_width_changed)
+        edge_row.addWidget(self.edge_width_slider, stretch=1)
+        edge_row.addWidget(self.edge_width_value)
+        v.addLayout(edge_row)
+
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.HLine)
+        sep2.setFrameShadow(QFrame.Sunken)
+        v.addWidget(sep2)
 
         v.addWidget(QLabel("Tracks"))
         self.tracks_table = QTableWidget(0, 2)
@@ -234,6 +285,36 @@ class IdentityAssignmentPanel(QWidget):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.session.add_track(dlg.track_name())
 
+    def _track_frames(self) -> None:
+        """Open the Track Frames dialog, then run track_all over the session."""
+        from track_dialog import TrackFramesDialog, run_track_all_with_progress
+
+        dlg = TrackFramesDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        num_animals = dlg.num_animals()
+
+        # Disable the button while running so a second click can't re-enter.
+        self.track_frames_btn.setEnabled(False)
+        try:
+            history = run_track_all_with_progress(
+                self.session,
+                parent=self,
+                num_animals=num_animals,
+            )
+        finally:
+            self.track_frames_btn.setEnabled(True)
+
+        if history is None:
+            return
+        # track_all already fires session signals as it runs; this final
+        # refresh just makes sure the assignments table matches the new
+        # identity map for the currently-selected frame.
+        self._refresh()
+        self._refresh_identities_legend()
+        self.identityAssignmentChanged.emit()
+
     def _on_mode_track_toggled(self, checked: bool) -> None:
         if checked:
             self.session.set_color_mode("track")
@@ -241,6 +322,18 @@ class IdentityAssignmentPanel(QWidget):
     def _on_mode_id_toggled(self, checked: bool) -> None:
         if checked:
             self.session.set_color_mode("identity")
+
+    def _on_node_size_changed(self, slider_val: int) -> None:
+        # Map slider [1..40] -> radius [0.5..20.0] in 0.5 increments.
+        radius = slider_val / 2.0
+        self.node_size_value.setText(f"{radius:.1f}")
+        self.session.set_node_size(radius)
+
+    def _on_edge_width_changed(self, slider_val: int) -> None:
+        # Map slider [1..40] -> width [0.5..20.0] in 0.5 increments.
+        width = slider_val / 2.0
+        self.edge_width_value.setText(f"{width:.1f}")
+        self.session.set_edge_width(width)
 
     def _sync_color_mode_ui(self, mode: str) -> None:
         self.color_mode_track_btn.blockSignals(True)

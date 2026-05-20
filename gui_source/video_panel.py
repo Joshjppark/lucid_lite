@@ -57,11 +57,19 @@ class VideoPanelWidget(QWidget):
         session.identities_changed.connect(self.update)
         session.tracks_changed.connect(self.update)
         session.color_mode_changed.connect(self.update)
+        session.appearance_changed.connect(self.update)
 
         # Initial frame request.
         self._request_frame(self._current_frame)
 
     # ---- public API ---------------------------------------------------
+
+    @property
+    def fps(self) -> float | None:
+        """Video FPS from the decoder, or None if no video opened."""
+        if self._decoder is None:
+            return None
+        return float(self._decoder.fps) if self._decoder.fps else None
 
     def set_current_frame(self, frame_idx: int) -> None:
         if frame_idx == self._current_frame:
