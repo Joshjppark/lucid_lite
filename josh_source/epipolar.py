@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from PySide6.QtGui import QImage
 
 
-from .geometry import *
+from .geometry_old import *
 # import geometry
 
 def qimg_to_np(qimg: QImage):

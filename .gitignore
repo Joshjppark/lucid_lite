@@ -3,6 +3,9 @@
 Thumbs.db
 uv.lock
 
+
+
+.prompts/
 .claude/
 .ipynb_checkpoints/
 
@@ -13,5 +16,5 @@ __pycache__/
 
 # Other files
 *.slp
-
+*.ipynb
 

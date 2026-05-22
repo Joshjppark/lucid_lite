@@ -1,42 +1,54 @@
 
-import logging
+
 import numpy as np
-from numpy import ndarray
 
+from collections import defaultdict
 from dataclasses import dataclass
-
-from .geometry import triangulate_group, reproject_points, instance_pixel_distance
-from .geometry import calc_epipolar_score, calc_reprojection_score, calc_fundamental_matrix
-from .geometry import *
-
 from scipy.optimize import linear_sum_assignment
 
-logging.basicConfig(level=logging.INFO)
+from .geometry import *
+from gui_source.pose_data import Camera, FrameGroup, Instance
 
 
 @dataclass
-class TrackerCache:
-    F: dict
-    P: dict
+class ProjCache:
+    '''
+    Stores projection matrix P and Fundamental matricies F
+    for a tracking session
+    '''
+    F: dict[str, np.ndarray]
+    P: dict[str, np.ndarray]
 
 
     def __init__(self):
         self.F = {}
         self.P = {}
 
-    
-    def getF(self, cam2, cam1) -> np.ndarray:
-        key = (cam2.name, cam1.name)
-        if key in self.F:
-            return self.F[key]
-        
-        F = calc_fundamental_matrix(cam2, cam1)
-        self.F[key] = F
+
+    def getF(self, cam1: Camera, cam2: Camera) -> np.ndarray:
+        '''
+        Returns fundamental matrix F such that (x1.T @ F @ x2) = 0
+        '''
+        F = self.F.get((cam1.name, cam2.name), None)
+
+
+        if F is None:
+            FT = self.F.get((cam2.name, cam1.name), None)
+            if FT: return F.T # previously calculated the other direction
+
+
+            F = calc_fundamental_matrix(cam1, cam2)
+
+            self.F[(cam1.name, cam2.name)] = F
+            self.F[(cam2.name, cam1.name)] = F.T
 
         return F
     
-    def getP(self, cam) -> np.ndarray:
 
+    def getP(self, cam: Camera) -> np.ndarray:
+        '''
+        Returns projection matrix P
+        '''
         P = self.P.get(cam.name, None)
         if P is None:
             R = rodrigues(cam.rvec)
@@ -45,173 +57,238 @@ class TrackerCache:
         return P
 
 
-
-def get_instances(frame_group, cameras):
-    cam_instances: dict[str, list] = {}
-    cam_map: dict[str, object] = {}
-    active_cams: list[str] = []
-
-    for cam in cameras:
-        instances: list = []
-        cam_map[cam.name] = cam
-
-        for inst in frame_group.get_instances(cam.name):
-            instances.append(inst)
-
-        for inst in frame_group.unlinked_instances.get(cam.name, []):
-            instances.append(inst)
-        
-        if len(instances) > 0:
-            active_cams.append(cam.name)
-            cam_instances[cam.name] = instances
-
-    return cam_instances, cam_map, active_cams
+@dataclass
+class Group:
+    # points: dict[str: np.ndarray]
+    # score: float
+    # valid: bool
+    id: int = None
+    points_3d: np.ndarray = None
 
 
-def hungarian(cost):
+    def __init__(self, group, instance_list, id_, cam_map, proj_cache):
 
-    # cost = np.where(np.isfinite(cost), cost, 1e18) # set inf values to 1e18
-    rows, cols = linear_sum_assignment(cost)
-
-    out = np.full(cost.shape[0], -1, dtype=int)
-    for r, c in zip(rows, cols):
-        out[r] = c
-    return out
-
-
-def cross_view_score(insts1, cam1, insts2, cam2, caches) -> float:
-    """0.4 * epipolar + 0.6 * reprojection."""
-    epipolar_score = calc_epipolar_score(insts1, cam1, insts2, cam2, caches)
-    reproj_score = calc_reprojection_score(insts1, cam1, insts2, cam2, caches)
-    return 0.4 * epipolar_score + 0.6 * reproj_score
-
-
-def match_pairwise(frame_group, session, cache, num_animals=0):
-
-
-    cam_instances, cam_map, active_cams = get_instances(frame_group, session.cameras)
-    cam_by_count = sorted(active_cams, key=lambda x: -len(cam_instances[x]))
-
-    most1, most2 = cam_by_count[0], cam_by_count[1]
-    cam1, cam2 = cam_map[most1], cam_map[most2]
-    insts1 = cam_instances[cam1.name]
-    insts2 = cam_instances[cam2.name]
-    ordered_cams = [most1, most2] + [c for c in active_cams if c != most1 and c != most2]
-
-    logging.info(f'cam1: {cam1.name}, cam2: {cam2.name}')
-
-    # add epipolar error into scoring matrix
-    n_a, n_b = len(insts1), len(insts2)
-    score_matrix = np.zeros((n_a, n_b))
-    for a in range(n_a):
-        for b in range(n_b):
-            # get epipolar score
-            score = calc_epipolar_score(insts1[a], cam1, insts2[b], cam2, cache)
-            score_matrix[a, b] = score
-
-
-    # get assignsments into matches
-    assignment = hungarian(-score_matrix)
-    matches: list = []
-    for r in range(n_a):
-        c = assignment[r]
-        score = score_matrix[r, c]
+        # default to a correct group with max 1 instance per cam
+        self.valid = True
 
         
-        matches.append({
-            'a': int(r),
-            'b': int(c),
-            'score': score
-        })
-    matches.sort(key=lambda m: -m['score'])
+        self.cams_by_count = defaultdict(int)
+        
+        points_by_cam = {}
+        cam_track: list[tuple[str, int]] = []
+        for instance_idx in group:
+            track_idx, cam, pts = instance_list[instance_idx]
 
 
-    # refine the matching score with reprojection score
-    for m_i in range(len(matches)):
-        m = matches[m_i]
-        new_score = cross_view_score(insts1[m['a']], cam1, insts2[m['b']], cam2, cache)
-        m['score'] = new_score
-    matches.sort(key=lambda m: -m["score"])
+            # store cam information
+            self.cams_by_count[cam] += 1
+            cam_track.append((cam, track_idx))
 
-    if num_animals:
-        matches = matches[:num_animals]
-    else:
-        matches = [m for m in matches if m['score'] > 0.05]
+            # add points to dictionary
+            if points_by_cam.get(cam, []):
+                points_by_cam[cam].append(pts)
+                self.valid = False # multiple instances in the same view
+            else:
+                points_by_cam[cam] = [pts]
 
-    # make Groups list of identity groups
-    groups = []
-    matched1, matched2 = set(), set()
-    for m in matches:
-        groups.append({
-            most1: insts1[m['a']],
-            most2: insts2[m['b']]
-        })
-        matched1.add(m['a'])
-        matched2.add(m['b'])
+
+        self.points_by_cam = points_by_cam
+        self.cam_track = cam_track
+        self.id = id_
+        self.points_3d, reprojs = self.triangulate(cam_map, proj_cache)
+        self.reproj_score = self._calc_reprojs(reprojs)
+
+
+    def triangulate(self, cam_map, cache):
+        group = {cam: self.points_by_cam[cam][0] for cam in self.points_by_cam}
+        points_3d, reprojs = triangulate_group(group, cam_map, cache, get_reprojections=True)
+        # print(f'points_3D for group {self.id} {points_3d}')
+
+        return points_3d, reprojs
+
+
+    def _calc_reprojs(self, reprojs) -> float:
+
+        reproj_score = {}
+        for cam in self.cams_by_count:
+            reproj_score[cam] = instance_pixel_distance(reprojs[cam], self.points_by_cam[cam][0])
+
+        
+        return reproj_score
+    
+
+class SingleFrameTrack:
+
+    def __init__(
+            self,
+            fg: FrameGroup,
+            cameras: Camera,
+            proj_cache: ProjCache,
+            skel_weight: np.ndarray
+        ) -> None:
+        '''
+        Params:
+        - fg: Framegroup of the current frame
+        - skel_weight: np array of the weights of each node in the skeleton, rannges from 0-1
+                        nodes with 0 weight are effectively ignored in all calculations
+        '''
+
+        self.fg = fg
+        self.proj_cache = proj_cache
+        self.skel_weight = None # this is updated in get_instance_dict() to remove zeros
+
+        instance_by_cam, inst_list = self.get_instance_dict(fg, skel_weight)
+
+        self.instance_by_cam: dict[tuple[int, np.ndarray]] = instance_by_cam
+        # key: cam name
+        # value: (instance_count:int, points: np.ndarray)
+
+
+        self.instance_list: list[tuple[int, str, np.ndarray]] = inst_list
+        # (track idx, cam name, points: np.ndarray)
+
+
+        self.cam_count_dict: dict[str, int] = {cam: len(insts) for cam, insts in fg.instances.items()}
+        self.cameras = [c for c in cameras if self.cam_count_dict.get(c.name, 0)]
+        self.cam_map = {c.name: c for c in self.cameras}
+
+        self.n_insts = len(inst_list)
+        self.adjacency_matrix = np.full((self.n_insts, self.n_insts), np.inf)
+        # self._calc_edge_weights()
+        # self._get_groups()
 
     
-    # pad out if num_animals is defined
-    if num_animals and len(groups) < num_animals:
-        for a in range(n_a):
-            if len(groups) >= num_animals:
-                break
-            if a not in matched1:
-                groups.append({most1: insts1[m['a']]})
-        for b in range(n_b):
-            if len(groups) >= num_animals:
-                break
-            if b not in matched2:
-                groups.append({most2: insts2[m['b']]})
+    def get_instance_dict(self, fg, skel_weight):
 
+        bool_mask = skel_weight != 0
+        self.skel_weight = skel_weight[bool_mask]
+
+        instance_by_cam = {}
+        instance_list = []
+        counter = 0
+        for cam_name, instances in fg.instances.items():
+            cam_points = []
+            for track_idx, inst in enumerate(instances):
+
+                pt = np.array([p if p is not None else (np.nan, np.nan) for p in inst.points])
+                pt = pt[bool_mask]
+
+                instance_list.append((track_idx, cam_name, pt))
+                cam_points.append((counter, pt))
+                
+                counter += 1
+            
+            instance_by_cam[cam_name] = cam_points
+
+        return instance_by_cam, instance_list
     
-    if not num_animals:
+
+
+    def _calc_edge_weights(self):
+        camera_pairs = self._get_camera_pairs()
+        
+        for (cam1, cam2) in camera_pairs:
+            edges:np.ndarray = self._calc_pairwise_edges(self.cam_map[cam1], self.cam_map[cam2])
+            rows, cols = linear_sum_assignment(edges)
+            # print(f'calculated edges with cams {cam1}, {cam2}')
+
+            # add row and column assignments from edge hungarian to the 
+            for r, c in zip(rows, cols):
+                inst1_idx = self.instance_by_cam[cam1][r][0]
+                inst2_idx = self.instance_by_cam[cam2][c][0]
+
+                self.adjacency_matrix[inst1_idx, inst2_idx] = edges[r, c]
+
+
+    def _calc_pairwise_edges(self, cam1: Camera, cam2: Camera) -> np.ndarray:
+
+        
+        cam1_points = self.instance_by_cam[cam1.name]
+        cam2_points = self.instance_by_cam[cam2.name]
+
+
+        edges = np.zeros((len(cam1_points), len(cam2_points)), dtype=np.float64)
+        
+
+        for idx1, (_, cam1_pt) in enumerate(cam1_points):
+            for idx2, (_, cam2_pt) in enumerate(cam2_points):
+
+                F = self.proj_cache.getF(cam1, cam2)
+                edges[idx1, idx2] = calc_epipolar_score(cam1_pt, cam2_pt, F)
+
+        return edges
+
+
+
+    def _run_bfs(self, matrix):
+        
+        visited = np.zeros(self.n_insts, dtype=bool)
+
+        groups = []
+        while not np.all(visited):
+
+            non_visisted = np.where(visited == np.False_)[0][0]
+            explored = [non_visisted]
+            visited[non_visisted] = True
+            
+            group = []
+
+            while explored:
+                vertex = explored.pop(0)
+                group.append(int(vertex))
+
+                for neighbor in np.where(matrix[vertex] != np.inf)[0]:
+                    if not visited[neighbor]:    
+                        # print(f'vertex {vertex} has neighbors {}')
+                        visited[neighbor] = True
+                        explored.append(neighbor)
+
+            groups.append(Group(group, self.instance_list, len(groups), self.cam_map, self.proj_cache))
+            # groups.append(group)
+        return groups
+
+
+
+
+    def _get_groups(self):
         raise NotImplementedError
     
+
+    def _get_camera_pairs(self):
+        cam_names = [c.name for c in self.cameras]
+
+        cam_pairs = []
+        for i in range(len(cam_names)):
+            for j in range(i+1, len(cam_names)):
+                pair = (cam_names[i], cam_names[j])
+                cam_pairs.append(pair)
+
+        return cam_pairs
+
     
-    # add remaining cameras via reprojection-distance Hungarian
-    for cam_name in ordered_cams[2:]:
-        cam3 = cam_map[cam_name]
-        insts3 = cam_instances.get(cam3.name, [])
-        if not insts3:
-            continue
-        
-        costs3 = np.full((len(groups), len(insts3)), np.inf)
-        P3 = cache.getP(cam3)
-        
-        for group_i, group in enumerate(groups):
-
-            X = triangulate_group(group, cam_map, cache)
-
-            reprojs = reproject_points(X, P3)
-
-            for inst_i in range(len(insts3)):
-                reproj_error = instance_pixel_distance(reprojs, insts3[inst_i])
-
-                costs3[group_i, inst_i] = reproj_error
-        assignment3 = hungarian(costs3)
-
-        # print(f'{cam3.name},\n {insts3}')
-        # return costs3
-        # print(f'assign3 is {assignment3}')
-        # print(f'length of groups is {len(groups)}')
-
-        for group_i in range(len(groups)):
-            inst_i = assignment3[group_i]
-
-            if inst_i < 0 or inst_i >= n_b: continue
-
-            if inst_i < len(insts3) and costs3[group_i, inst_i] < 100:
-                # add this instance to the group
-                groups[group_i][cam_name] = insts3[inst_i]
-
-        if not num_animals:
-            raise NotImplementedError
+    
+    def __repr__(self):
+        return f'{self.instance_dict}'
         
 
 
-    return groups
 
 
+def track_frame(framegroup):
 
-def match_frame_instances(frame_group, cameras, session):
     pass
+
+
+def track_all(session):
+    '''
+    tracks all the frames.
+    
+    nowhere near done completion
+    '''
+
+    for frame in (session.frame_indices):
+        fg = session.frame_group(frame)
+        track_frame(fg)
+
+        raise NotImplementedError
+    

@@ -110,6 +110,10 @@ class Session(QObject):
         # Overlay appearance (mutated by the Track/ID tab sliders).
         self.node_size: float = 4.0   # node circle radius in video pixels
         self.edge_width: float = 2.0  # skeleton edge stroke width in video pixels
+        # Toggle for the per-instance identity-name text label drawn next to
+        # the skeleton. Track-index labels ("t0", "t1") are unconditionally
+        # suppressed in overlay_renderer._instance_label.
+        self.show_identity_labels: bool = True
         # frame_idx -> FrameGroup
         self.frame_groups: dict[int, FrameGroup] = {}
         # frame_idx -> list[InstanceGroup]
@@ -353,6 +357,13 @@ class Session(QObject):
         if abs(v - self.edge_width) < 1e-6:
             return
         self.edge_width = v
+        self._emit("appearance_changed")
+
+    def set_show_identity_labels(self, value: bool) -> None:
+        v = bool(value)
+        if v == self.show_identity_labels:
+            return
+        self.show_identity_labels = v
         self._emit("appearance_changed")
 
     def next_instance_group_id(self) -> int:

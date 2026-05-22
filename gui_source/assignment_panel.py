@@ -8,9 +8,10 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QButtonGroup, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
-    QRadioButton, QSlider, QTableWidget, QTableWidgetItem, QTabWidget,
-    QVBoxLayout, QWidget,
+    QButtonGroup, QCheckBox, QComboBox, QDialog, QFrame, QHBoxLayout,
+    QHeaderView, QLabel, QPushButton, QRadioButton, QSlider, QTableWidget,
+    QTableWidgetItem, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
 from colors import get_track_color
@@ -66,11 +67,22 @@ class IdentityAssignmentPanel(QWidget):
         self.frame_label.setStyleSheet("font-weight: bold;")
         v.addWidget(self.frame_label)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Camera", "Track", "Identity", "Scope"])
-        self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        v.addWidget(self.table)
+        # Tree layout: camera names are top-level nodes (bold), tracks at
+        # that frame are indented children. Column 0 holds the camera name
+        # at the top level and "track_idx (track_name)" at the leaf level.
+        # Identity combo lives in column 1, scope text in column 2.
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(3)
+        self.tree.setHeaderLabels(["Camera / Track", "Identity", "Scope"])
+        self.tree.setRootIsDecorated(True)
+        self.tree.setIndentation(16)
+        self.tree.setUniformRowHeights(True)
+        header = self.tree.header()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setStretchLastSection(False)
+        v.addWidget(self.tree)
 
         self._tabs.addTab(tab, "Assignments")
 
@@ -112,6 +124,23 @@ class IdentityAssignmentPanel(QWidget):
         mode_row.addWidget(self.color_mode_id_btn)
         mode_row.addStretch()
         v.addLayout(mode_row)
+
+        # Identity-name label visibility. Off → overlays still draw skeleton
+        # edges + nodes + node markers but no text. Drives
+        # Session.show_identity_labels via set_show_identity_labels, which
+        # emits appearance_changed → every video panel repaints.
+        labels_row = QHBoxLayout()
+        labels_row.addWidget(QLabel("Labels:"))
+        self.show_id_labels_chk = QCheckBox("Show identity names")
+        self.show_id_labels_chk.setChecked(bool(self.session.show_identity_labels))
+        self.show_id_labels_chk.setToolTip(
+            "Show or hide the identity-name text drawn next to each instance "
+            "in the video overlay."
+        )
+        self.show_id_labels_chk.toggled.connect(self._on_show_id_labels_toggled)
+        labels_row.addWidget(self.show_id_labels_chk)
+        labels_row.addStretch()
+        v.addLayout(labels_row)
 
         # ---- skeleton appearance sliders (node radius + edge width) -----
         sep = QFrame()
@@ -185,50 +214,81 @@ class IdentityAssignmentPanel(QWidget):
         self._populating = True
         try:
             fg = self.session.frame_group(self._current_frame)
-            rows: list[tuple[str, int]] = []
-            if fg is not None:
-                for cam_name in sorted(fg.instances.keys()):
-                    seen_tracks: set[int] = set()
-                    for inst in fg.instances[cam_name]:
-                        if inst.track_idx is None or inst.track_idx in seen_tracks:
+            # Show every known camera once, even if no instances at this
+            # frame. Order follows session.camera_names() (loader order) so
+            # the panel matches the video grid layout.
+            cam_names = self.session.camera_names()
+            self.tree.clear()
+
+            for cam_name in cam_names:
+                cam_item = QTreeWidgetItem([cam_name, "", ""])
+                cam_font = cam_item.font(0)
+                cam_font.setBold(True)
+                cam_item.setFont(0, cam_font)
+                # Camera rows are headers — not selectable, not editable.
+                cam_item.setFlags(cam_item.flags() & ~Qt.ItemIsSelectable)
+                self.tree.addTopLevelItem(cam_item)
+                cam_item.setExpanded(True)
+
+                # Unique tracks visible in this camera at the current frame.
+                tracks_here: list[int] = []
+                if fg is not None:
+                    seen: set[int] = set()
+                    for inst in fg.get_instances(cam_name):
+                        if inst.track_idx is None or inst.track_idx in seen:
                             continue
-                        seen_tracks.add(inst.track_idx)
-                        rows.append((cam_name, inst.track_idx))
+                        seen.add(inst.track_idx)
+                        tracks_here.append(inst.track_idx)
 
-            self.table.setRowCount(len(rows))
-            for row_i, (cam_name, track_idx) in enumerate(rows):
-                self.table.setItem(row_i, 0, _ro_item(cam_name))
-                track_name = (
-                    self.session.tracks[track_idx]
-                    if 0 <= track_idx < len(self.session.tracks)
-                    else f"t{track_idx}"
-                )
-                self.table.setItem(row_i, 1, _ro_item(f"{track_idx} ({track_name})"))
+                if not tracks_here:
+                    # Reserve visual space under empty cameras with a muted
+                    # placeholder row — non-selectable, non-interactive.
+                    ph = QTreeWidgetItem(["(no instances)", "", ""])
+                    ph_font = ph.font(0)
+                    ph_font.setItalic(True)
+                    ph.setFont(0, ph_font)
+                    ph.setForeground(0, QColor("#888888"))
+                    ph.setFlags(ph.flags() & ~Qt.ItemIsSelectable & ~Qt.ItemIsEnabled)
+                    cam_item.addChild(ph)
+                    continue
 
-                combo = QComboBox()
-                self._fill_identity_combo(combo)
+                for track_idx in tracks_here:
+                    track_name = (
+                        self.session.tracks[track_idx]
+                        if 0 <= track_idx < len(self.session.tracks)
+                        else f"t{track_idx}"
+                    )
+                    track_item = QTreeWidgetItem(
+                        [f"{track_idx} ({track_name})", "", ""]
+                    )
+                    track_item.setFlags(track_item.flags() & ~Qt.ItemIsSelectable)
+                    cam_item.addChild(track_item)
 
-                effective_id = self.session.get_identity_id_for_track(
-                    self._current_frame, cam_name, track_idx
-                )
-                combo.setCurrentIndex(self._find_combo_index(combo, effective_id))
+                    combo = QComboBox()
+                    self._fill_identity_combo(combo)
+                    effective_id = self.session.get_identity_id_for_track(
+                        self._current_frame, cam_name, track_idx
+                    )
+                    combo.setCurrentIndex(self._find_combo_index(combo, effective_id))
+                    combo.currentIndexChanged.connect(
+                        lambda _idx, cam=cam_name, tr=track_idx, cb=combo:
+                            self._on_identity_changed(cam, tr, cb)
+                    )
+                    self.tree.setItemWidget(track_item, 1, combo)
 
-                combo.currentIndexChanged.connect(
-                    lambda _idx, r=row_i, cam=cam_name, tr=track_idx, cb=combo:
-                        self._on_identity_changed(r, cam, tr, cb)
-                )
-                self.table.setCellWidget(row_i, 2, combo)
+                    # Scope: per-frame override vs global.
+                    per_key = f"{self._current_frame}:{cam_name}:{track_idx}"
+                    scope = (
+                        "frame"
+                        if per_key in self.session.frame_identity_map
+                        else "global"
+                    )
+                    track_item.setText(2, scope)
 
-                # Scope: per-frame override vs global
-                per_key = f"{self._current_frame}:{cam_name}:{track_idx}"
-                scope = "frame" if per_key in self.session.frame_identity_map else "global"
-                self.table.setItem(row_i, 3, _ro_item(scope))
-
-                # Color swatch in the Camera cell background
-                ident = self.session.get_identity(effective_id)
-                if ident is not None:
-                    item = self.table.item(row_i, 0)
-                    item.setBackground(QColor(ident.color))
+                    # Identity color swatch behind the track label.
+                    ident = self.session.get_identity(effective_id)
+                    if ident is not None:
+                        track_item.setBackground(0, QColor(ident.color))
         finally:
             self._populating = False
 
@@ -266,7 +326,7 @@ class IdentityAssignmentPanel(QWidget):
 
     # ---- handlers -----------------------------------------------------
 
-    def _on_identity_changed(self, row: int, cam_name: str, track_idx: int, combo: QComboBox) -> None:
+    def _on_identity_changed(self, cam_name: str, track_idx: int, combo: QComboBox) -> None:
         if self._populating:
             return
         new_id = combo.currentData()
@@ -334,6 +394,9 @@ class IdentityAssignmentPanel(QWidget):
         width = slider_val / 2.0
         self.edge_width_value.setText(f"{width:.1f}")
         self.session.set_edge_width(width)
+
+    def _on_show_id_labels_toggled(self, checked: bool) -> None:
+        self.session.set_show_identity_labels(checked)
 
     def _sync_color_mode_ui(self, mode: str) -> None:
         self.color_mode_track_btn.blockSignals(True)

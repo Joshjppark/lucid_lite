@@ -31,6 +31,7 @@ def draw_overlay_for_camera(
 
     node_radius = float(getattr(session, "node_size", NODE_RADIUS))
     edge_width = float(getattr(session, "edge_width", EDGE_WIDTH))
+    show_labels = bool(getattr(session, "show_identity_labels", True))
 
     # Instances attached to this camera (linked via track_idx).
     #
@@ -56,7 +57,7 @@ def draw_overlay_for_camera(
         else:
             color_hex = get_track_color(inst.track_idx)
         _draw_instance(painter, inst, session.skeleton, color_hex, video_to_panel,
-                       label=_instance_label(inst, ident),
+                       label=_instance_label(inst, ident) if show_labels else "",
                        node_radius=node_radius, edge_width=edge_width)
 
     # Unlinked instances (no track yet) — rare in SLP imports but we draw them
@@ -72,11 +73,13 @@ def draw_overlay_for_camera(
 
 
 def _instance_label(inst: Instance, ident) -> str:
+    # Only show identity names. Track-index fallbacks (eg. "t0", "t1") and
+    # the "?" placeholder used to render as overlay text; both are now
+    # suppressed by returning an empty string, which `_draw_instance` skips
+    # via the `if anchor is not None and label` guard below.
     if ident is not None:
         return ident.name
-    if inst.track_idx is not None:
-        return f"t{inst.track_idx}"
-    return "?"
+    return ""
 
 
 def _draw_instance(painter, inst: Instance, skeleton, color_hex: str,
