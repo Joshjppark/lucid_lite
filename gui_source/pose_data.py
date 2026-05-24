@@ -97,6 +97,10 @@ class Session(QObject):
     color_mode_changed = Signal(str)
     # Emitted when overlay appearance (node radius, edge width) is tweaked.
     appearance_changed = Signal()
+    # Emitted when frame_tracker_groups is mutated for some frame (the graph
+    # window listens to know when to redraw). Payload-free: consumers re-read
+    # state via Session.frame_tracker_groups.get(frame_idx).
+    groups_changed = Signal()
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
@@ -122,6 +126,19 @@ class Session(QObject):
         self.track_identity_map: dict[str, int] = {}
         # "frameIdx:camName:trackIdx" -> identity_id
         self.frame_identity_map: dict[str, int] = {}
+        # frame_idx -> opaque bundle of tracker output. Populated only by
+        # explicit user calls (see notebooks/tracking_test.ipynb
+        # push_frame_assignments). Read by graph_window. Stored opaquely so
+        # this module does not import from josh_source/tracker.py (which is
+        # actively churning). Bundle shape:
+        #   {
+        #     "groups":           list[tracker.Group],          # from sft._run_bfs
+        #     "adjacency_matrix": np.ndarray (n, n) | None,     # sft.adjacency_matrix
+        #     "instance_list":    list[(track_idx, cam_name, pts)] | None,
+        #   }
+        # Graph rendering depends on Group attributes (.cam_track, .valid)
+        # plus the matrix/instance_list pair for edge weights and layout.
+        self.frame_tracker_groups: dict[int, dict] = {}
         # camera_name -> path to mp4
         self.video_paths: dict[str, Path] = {}
         # internal counters
@@ -184,6 +201,7 @@ class Session(QObject):
                     "identities_changed", "tracks_changed",
                     "identity_map_changed", "frame_groups_changed",
                     "color_mode_changed", "appearance_changed",
+                    "groups_changed",
                 ):
                     if name in pending:
                         sig = getattr(self, name)
@@ -365,6 +383,43 @@ class Session(QObject):
             return
         self.show_identity_labels = v
         self._emit("appearance_changed")
+
+    def set_groups_for_frame(
+        self,
+        frame_idx: int,
+        groups,
+        adjacency_matrix=None,
+        instance_list=None,
+    ) -> None:
+        """Store the tracker-derived groups for a single frame.
+
+        `groups` is a list (or tuple) of tracker.Group objects from
+        SingleFrameTrack._run_bfs. `adjacency_matrix` is the (n, n) ndarray
+        with np.inf marking missing edges; `instance_list` is the parallel
+        list of `(track_idx, cam_name, points)` tuples that maps matrix
+        index → instance. Both are stored opaquely so the graph viewer
+        can render edge weights without re-running the tracker.
+
+        Pass `groups=None` or an empty sequence to clear the entry. The
+        graph window listens on `groups_changed` to know to redraw.
+        """
+        if groups:
+            self.frame_tracker_groups[frame_idx] = {
+                "groups": list(groups),
+                "adjacency_matrix": adjacency_matrix,
+                "instance_list": (
+                    list(instance_list) if instance_list is not None else None
+                ),
+            }
+        else:
+            self.frame_tracker_groups.pop(frame_idx, None)
+        self._emit("groups_changed")
+
+    def get_groups_for_frame(self, frame_idx: int):
+        """Returns the bundle dict (with keys 'groups', 'adjacency_matrix',
+        'instance_list') or None if no entry exists at this frame.
+        """
+        return self.frame_tracker_groups.get(frame_idx)
 
     def next_instance_group_id(self) -> int:
         self._instance_group_counter += 1

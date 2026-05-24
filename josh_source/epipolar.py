@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from PySide6.QtGui import QImage
 
 
-from .geometry_old import *
+from .geometry import *
 # import geometry
 
 def qimg_to_np(qimg: QImage):
@@ -65,7 +65,7 @@ def display_cams(window, cam_names, df, SKEL, TRACK_COLOR_MAP, grid_shape=None, 
 
 
 
-def draw_epline_single_point(window, CAMERAS, cam_names, df, node_idx, track_idx=0):
+def draw_epline_single_point(window, fg ,CAMERAS, cam_names, df, node_idx, track_idx=0):
 
     '''
     Draws a 2x2 grid, where each row has the two cameras and
@@ -82,13 +82,26 @@ def draw_epline_single_point(window, CAMERAS, cam_names, df, node_idx, track_idx
     F2 = calc_fundamental_matrix(cam2, cam1)
 
 
-    instance_1_pts = np.asarray(df.query('cam == @cam_names[0] and track_idx == @track_idx')['points'].iloc[0])
-    instance_2_pts = np.asarray(df.query('cam == @cam_names[1] and track_idx == @track_idx')['points'].iloc[0])
+    # pts1 = df.query('cam == @cam_names[0] and track_idx == @track_idx')['points'].iloc[0]
+    # pts2 = df.query('cam == @cam_names[1] and track_idx == @track_idx')['points'].iloc[0]
+
+    pts1 = df.query('cam == @cam_names[0] and track_idx == 3')['points'].iloc[0]
+    pts2 = df.query('cam == @cam_names[1] and track_idx == 2')['points'].iloc[0]
+
+    instance_1_pts = np.array([p if p is not None else (np.nan, np.nan) for p in pts1])
+    instance_2_pts = np.array([p if p is not None else (np.nan, np.nan) for p in pts2])
+
+
+
     points = [instance_1_pts, instance_2_pts]
 
 
-    line1 = F1 @ homogenize(instance_2_pts[node_idx])
-    line2 = F2 @ homogenize(instance_1_pts[node_idx])
+    line1 = F1.T @ homogenize(instance_2_pts[node_idx])
+    line2 = F2.T @ homogenize(instance_1_pts[node_idx])
+
+    # print(f'line1 shape: {line1.shape}')
+    # print(f'line2 shape: {line2.shape}')
+
     lines = [line1, line2]
 
     err1 = homogenize(instance_1_pts[node_idx]).T @ line1 / (np.linalg.norm(line1[:2])) 
@@ -107,7 +120,7 @@ def draw_epline_single_point(window, CAMERAS, cam_names, df, node_idx, track_idx
         for cam, ax, instance_pts in zip(cam_names, axs, points):
             
             # get frame video data
-            qimg = window._video_panels[cam]._decoder.get_frame(window._current_frame)
+            qimg = window._video_panels[cam]._decoder.get_frame(fg.frame_idx)
             frame = qimg_to_np(qimg)
 
             # display frame
@@ -147,12 +160,12 @@ def draw_eplines_whole_instance(window, CAMERAS, cam_names, df, track_idx=0):
     cam1 = CAMERAS[cam_names[0]] 
     cam2 = CAMERAS[cam_names[1]]
 
-    F1 = calc_fundamental_matrix(cam1, cam2)
+    F2 = calc_fundamental_matrix(cam1, cam2)
     # F2 = calc_fundamental_matrix(cam2, cam1)
-    F2 = F1.T
+    F1 = F2.T
 
-    pts_1 = df.query('cam == @cam_names[0] and track_idx == @track_idx')['points'].iloc[0]
-    pts_2 = df.query('cam == @cam_names[1] and track_idx == @track_idx')['points'].iloc[0]
+    pts_1 = df.query('cam == @cam_names[0] and track_idx == 3')['points'].iloc[0]
+    pts_2 = df.query('cam == @cam_names[1] and track_idx == 2')['points'].iloc[0]
     instance_1_pts = np.asarray([p if p is not None else (np.nan, np.nan) for p in pts_1])
     instance_2_pts = np.asarray([p if p is not None else (np.nan, np.nan) for p in pts_2])
     points = [instance_1_pts, instance_2_pts]
@@ -160,6 +173,18 @@ def draw_eplines_whole_instance(window, CAMERAS, cam_names, df, track_idx=0):
     # shape of lines: (3, n), n = 15
     lines1 = F1 @ homogenize(instance_2_pts).T
     lines2 = F2 @ homogenize(instance_1_pts).T
+
+    # print(f'lines1 shape: {lines1.shape}')
+    # print(f'lines2 shape: {lines2.shape}')
+
+    # from josh_source.geometry import calc_epipolar_lines
+    # lines1 = calc_epipolar_lines(F1, homogenize(instance_2_pts))
+    # lines2 = calc_epipolar_lines(F2, homogenize(instance_1_pts))
+
+
+    print(f'lines1 shape: {lines1.shape}')
+    print(f'lines2 shape: {lines2.shape}')
+
     lines = [lines1, lines2]
 
     err1 = np.sum(homogenize(instance_1_pts) * lines1.T, axis=1) / (np.linalg.norm(lines1.T[:, :2], axis=1)) 

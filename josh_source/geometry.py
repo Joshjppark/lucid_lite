@@ -6,6 +6,9 @@ import numpy as np
 
 def rodrigues(rvec):
     theta = np.linalg.norm(rvec)
+    if theta < 1e-8:
+        return np.eye(3)
+
     u = rvec / theta
     ux, uy, uz = u
     u_skew = np.array([
@@ -45,7 +48,7 @@ def dehomogenize(arr: np.ndarray):
         return arr[:, :3] / arr[:, -1].reshape(-1, 1)
 
 
-def calc_fundamental_matrix(cam2, cam1):
+def calc_fundamental_matrix(cam1, cam2):
     K1 = np.asarray(cam1.matrix, dtype=np.float64)
     K2 = np.asarray(cam2.matrix, dtype=np.float64)
     t1 = np.asarray(cam1.tvec, dtype=np.float64).reshape(-1, 1)
@@ -63,23 +66,35 @@ def calc_fundamental_matrix(cam2, cam1):
     return F
 
 
-def calc_epipolar_score(pt1, pt2, F):
+def calc_epipolar_score(pt1, pt2, F, node_weights=None):
     
 
     pt1, pt2 = homogenize(pt1), homogenize(pt2)
 
-
     logging.debug(f'inst1 {pt1.shape}; inst2 {pt2.shape}')
+    lines1 = calc_epipolar_lines(F.T, pt2) # shape (3, N__nodes
+    lines2 = calc_epipolar_lines(F, pt1) # shape (3, N__nodes
 
+    # print(f'node_weights is {node_weights}')
+    if node_weights is None:
+       node_weights = np.ones(pt1.shape[0]) 
 
-    total_error = 0
-    lines = F @ pt2.T  # shape (3, n_nodes)
-    error = np.abs(np.sum(pt1.T * lines, axis=0)) / np.linalg.norm(lines[:2, :], axis=0)
+    error1 = np.abs(node_weights * np.sum(pt1 * lines1.T, axis=1)) / (np.linalg.norm(lines1.T[:, :2], axis=1))
+    error2 = np.abs(node_weights * np.sum(pt2 * lines2.T, axis=1)) / (np.linalg.norm(lines2.T[:, :2], axis=1))
+    assert error1.shape == error2.shape == (pt1.shape[0],)
+    err = [error1, error2]
 
-    return np.nanmean(error)
+    return np.nanmean(err)
     # print(f'total, {total}')
     # neg_ave = -np.nanmean(error)
     # return np.exp(neg_ave / 10)
+
+
+def calc_epipolar_lines(F, pt):
+    assert pt.shape[1] == 3
+    return F @ pt.T
+
+
 
 
 def triangulate_dlt(points, Ps):
@@ -122,19 +137,21 @@ def triangulate_group(group: dict, cam_map, cache, get_reprojections=False):
 
     for n in range(n_nodes):
         points2D = []
-        for cam, pt_undist in zip(cams, undistorted_pts):
+        valid_Ps = []
+        for cam, pt_undist, P in zip(cams, undistorted_pts, Ps):
 
             pt = pt_undist[n]
             if np.any(np.isnan(pt)):
                 continue
             
+            valid_Ps.append(P)
             points2D.append(pt)
 
         if len(points2D) < 2:
             points3D.append(np.full(4, np.nan))
         else:
             points2D = np.vstack(points2D)
-            points3D.append(triangulate_dlt(points2D, Ps))
+            points3D.append(triangulate_dlt(points2D, valid_Ps))
     
     points3D = np.vstack(points3D)
 

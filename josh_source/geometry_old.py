@@ -50,7 +50,7 @@ def dehomogenize(arr: ndarray):
         return arr[:, :3] / arr[:, -1].reshape(-1, 1)
 
 
-def calc_fundamental_matrix(cam2, cam1):
+def calc_fundamental_matrix(cam1, cam2):
     K1 = np.asarray(cam1.matrix, dtype=np.float64)
     K2 = np.asarray(cam2.matrix, dtype=np.float64)
     t1 = np.asarray(cam1.tvec, dtype=np.float64).reshape(-1, 1)

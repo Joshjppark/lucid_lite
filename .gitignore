@@ -15,6 +15,7 @@ __pycache__/
 *.so
 
 # Other files
+*.md
 *.slp
 *.ipynb
 

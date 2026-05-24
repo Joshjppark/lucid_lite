@@ -29,6 +29,8 @@ class IdentityAssignmentPanel(QWidget):
         self.session = session
         self._current_frame: int = session.min_frame
         self._populating: bool = False
+        # Lazily-created non-modal window opened from the Groups tab.
+        self._graph_window = None  # type: ignore[assignment]
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -38,6 +40,7 @@ class IdentityAssignmentPanel(QWidget):
 
         self._build_assignments_tab()
         self._build_track_id_tab()
+        self._build_groups_tab()
 
         # Assignments-tab refresh: all four model signals feed _refresh.
         session.identity_map_changed.connect(self._refresh)
@@ -200,6 +203,28 @@ class IdentityAssignmentPanel(QWidget):
         v.addWidget(self.identities_table)
 
         self._tabs.addTab(tab, "Track/ID")
+
+    def _build_groups_tab(self) -> None:
+        """Groups tab: just a button that opens the group-graph window.
+
+        Group data itself is computed and pushed by the notebook (see
+        push_frame_assignments in notebooks/tracking_test.ipynb); this tab is
+        the GUI entry-point for *viewing* what was pushed.
+        """
+        tab = QWidget()
+        v = QVBoxLayout(tab)
+
+        self.show_graph_btn = QPushButton("Show Group Assignment Graphs")
+        self.show_graph_btn.setToolTip(
+            "Open a window showing the k-partite group graph for the current "
+            "frame (or any frame entered in the window's frame field). "
+            "Populated by push_frame_assignments in the notebook."
+        )
+        self.show_graph_btn.clicked.connect(self._show_group_graph)
+        v.addWidget(self.show_graph_btn)
+        v.addStretch(1)
+
+        self._tabs.addTab(tab, "Groups")
 
     # ---- external API -------------------------------------------------
 
@@ -397,6 +422,25 @@ class IdentityAssignmentPanel(QWidget):
 
     def _on_show_id_labels_toggled(self, checked: bool) -> None:
         self.session.set_show_identity_labels(checked)
+
+    def _show_group_graph(self) -> None:
+        """Open (or raise) the non-modal group-graph window.
+
+        Lazily imports `graph_window` so the matplotlib backend is only
+        loaded if the user actually clicks the button.
+        """
+        if self._graph_window is None:
+            from graph_window import GroupGraphWindow
+            self._graph_window = GroupGraphWindow(
+                self.session, self._current_frame, parent=self.window()
+            )
+        else:
+            # If the window was opened from a different frame previously, jump
+            # to the panel's current frame on each re-open.
+            self._graph_window.set_frame(self._current_frame)
+        self._graph_window.show()
+        self._graph_window.raise_()
+        self._graph_window.activateWindow()
 
     def _sync_color_mode_ui(self, mode: str) -> None:
         self.color_mode_track_btn.blockSignals(True)

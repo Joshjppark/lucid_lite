@@ -6,11 +6,18 @@ from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QPushButton, QWidget
 
 import overlay_renderer
 from pose_data import Session
 from video_decoder import DecodeWorker, OnDemandVideoDecoder
+
+# Zoom limits (multiplicative). 0.5×–20× covers "fit to panel zoomed out" to
+# "single-pixel inspection". Wheel step is 1.15× per notch — feels natural
+# without overshooting.
+_ZOOM_MIN = 0.5
+_ZOOM_MAX = 20.0
+_ZOOM_STEP = 1.15
 
 
 class VideoPanelWidget(QWidget):
@@ -51,6 +58,33 @@ class VideoPanelWidget(QWidget):
         self.setMinimumSize(320, 180)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setStyleSheet("background-color: #111;")
+
+        # ---- zoom / pan state ----------------------------------------
+        # `_zoom` is multiplicative around the letterbox center; `_pan_*`
+        # is an additional translation in panel coordinates. Applied
+        # together via QPainter transforms in paintEvent, so the overlay
+        # picks up the same transform as the video pixmap automatically.
+        self._zoom: float = 1.0
+        self._pan_x: float = 0.0
+        self._pan_y: float = 0.0
+        # Drag-to-pan state.
+        self._panning: bool = False
+        self._pan_grab_x: float = 0.0
+        self._pan_grab_y: float = 0.0
+        self._pan_start_x: float = 0.0
+        self._pan_start_y: float = 0.0
+
+        # Floating "Reset Zoom" button, child of self so it tracks resizes.
+        # Repositioned in resizeEvent. Hidden unless zoom/pan is non-default.
+        self._unzoom_btn = QPushButton("Reset Zoom", self)
+        self._unzoom_btn.setStyleSheet(
+            "QPushButton { background-color: rgba(0,0,0,180); color: #fff; "
+            "padding: 3px 8px; border: 1px solid #aaa; border-radius: 3px; "
+            "font-size: 9pt; }"
+            "QPushButton:hover { background-color: rgba(40,40,40,220); }"
+        )
+        self._unzoom_btn.clicked.connect(self.reset_zoom)
+        self._unzoom_btn.hide()
 
         # Listen to model changes.
         session.identity_map_changed.connect(self.update)
@@ -96,22 +130,38 @@ class VideoPanelWidget(QWidget):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
 
         cell_w, cell_h = self.width(), self.height()
         rect = _letterbox(self._video_w, self._video_h, cell_w, cell_h)
 
-        # Clear background
+        # Clear background — drawn in panel coords, NOT inside the zoom
+        # transform, so the dark border around a zoomed-in frame stays put.
         painter.fillRect(self.rect(), QColor("#111"))
 
-        # Video pixmap
+        # Apply zoom + pan as a painter transform. The transform is
+        # additive: `pan` first (in panel coords), then scale around the
+        # letterbox center. Both the video pixmap and the overlay draw
+        # commands go through this transform, so the pose overlay zooms
+        # together with the frame underneath.
+        had_transform = (self._zoom != 1.0) or self._pan_x or self._pan_y
+        if had_transform:
+            cx, cy = rect.center().x(), rect.center().y()
+            painter.translate(self._pan_x, self._pan_y)
+            painter.translate(cx, cy)
+            painter.scale(self._zoom, self._zoom)
+            painter.translate(-cx, -cy)
+
+        # Video pixmap.
         if self._pixmap is not None:
             painter.drawPixmap(rect, self._pixmap, QRectF(self._pixmap.rect()))
         else:
             painter.setPen(QColor("#555"))
-            painter.drawText(self.rect(), Qt.AlignCenter,
+            painter.drawText(rect, Qt.AlignCenter,
                              f"{self.camera_name}\n(no video)")
 
-        # Overlay — map (x,y) in video pixels to panel coords
+        # Overlay — v2p maps to letterbox coords. The painter transform
+        # above takes care of zoom/pan.
         def v2p(x: float, y: float) -> QPointF:
             px = rect.x() + (x / self._video_w) * rect.width()
             py = rect.y() + (y / self._video_h) * rect.height()
@@ -123,13 +173,129 @@ class VideoPanelWidget(QWidget):
             self.camera_name, self._current_frame, v2p,
         )
 
-        # Camera name badge
+        # Reset to panel coords for chrome (camera name badge).
+        if had_transform:
+            painter.resetTransform()
+
+        # Camera-name badge (kept small — the dock title bar shows the name
+        # too, but the in-canvas badge survives floating/un-titled docks
+        # and is useful for screenshots).
         painter.setPen(QColor("#ffffff"))
         font = painter.font()
-        font.setPointSize(10)
+        font.setPointSize(9)
         font.setBold(True)
         painter.setFont(font)
-        painter.drawText(8, 20, self.camera_name)
+        painter.drawText(8, 18, self.camera_name)
+
+    # ---- zoom + pan input -------------------------------------------
+
+    def wheelEvent(self, event) -> None:
+        """Cursor-anchored zoom on mouse wheel. Holds the video coord under
+        the cursor stable across the zoom."""
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return super().wheelEvent(event)
+
+        factor = _ZOOM_STEP if delta > 0 else (1.0 / _ZOOM_STEP)
+        new_zoom = max(_ZOOM_MIN, min(_ZOOM_MAX, self._zoom * factor))
+        if new_zoom == self._zoom:
+            return event.accept()
+        # Actual factor after clamping.
+        s = new_zoom / self._zoom
+
+        # Compute new pan so that the panel point under the cursor maps to
+        # the same video point as before. Derivation in the changelog: keep
+        # `(px - cx - pan)/scale` invariant.
+        rect = _letterbox(self._video_w, self._video_h, self.width(), self.height())
+        cx, cy = rect.center().x(), rect.center().y()
+        pos = event.position()
+        px, py = pos.x(), pos.y()
+        self._pan_x = s * self._pan_x + (1.0 - s) * (px - cx)
+        self._pan_y = s * self._pan_y + (1.0 - s) * (py - cy)
+        self._zoom = new_zoom
+
+        self._update_unzoom_btn()
+        self.update()
+        event.accept()
+
+    def mousePressEvent(self, event) -> None:
+        # Right-click drag OR Shift+left-click drag = pan. Plain left-click
+        # is reserved so future selection / drag-instance work can hook in.
+        is_pan = (
+            event.button() == Qt.RightButton
+            or (event.button() == Qt.LeftButton
+                and event.modifiers() & Qt.ShiftModifier)
+        )
+        if is_pan:
+            self._panning = True
+            pos = event.position()
+            self._pan_grab_x = pos.x()
+            self._pan_grab_y = pos.y()
+            self._pan_start_x = self._pan_x
+            self._pan_start_y = self._pan_y
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._panning:
+            pos = event.position()
+            self._pan_x = self._pan_start_x + (pos.x() - self._pan_grab_x)
+            self._pan_y = self._pan_start_y + (pos.y() - self._pan_grab_y)
+            self._update_unzoom_btn()
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._panning and event.button() in (Qt.RightButton, Qt.LeftButton):
+            self._panning = False
+            self.unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        """Double-click anywhere on the panel resets zoom + pan — matches
+        the convention used in luc3d's viewport."""
+        if event.button() == Qt.LeftButton:
+            self.reset_zoom()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def reset_zoom(self) -> None:
+        """Restore the default (no-zoom, no-pan) view."""
+        if self._zoom == 1.0 and self._pan_x == 0.0 and self._pan_y == 0.0:
+            return
+        self._zoom = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._update_unzoom_btn()
+        self.update()
+
+    def _update_unzoom_btn(self) -> None:
+        """Show the Reset Zoom button only when there's something to reset.
+
+        Uses `isHidden()` (inverted) rather than `isVisible()` because the
+        latter returns False whenever any ancestor is hidden — which makes
+        the toggle flaky during construction and in headless tests.
+        `isHidden()` reflects the most recent setVisible() call directly.
+        """
+        active = bool((self._zoom != 1.0) or self._pan_x or self._pan_y)
+        currently_shown = not self._unzoom_btn.isHidden()
+        if active != currently_shown:
+            self._unzoom_btn.setVisible(active)
+
+    def resizeEvent(self, event) -> None:
+        # Pin the Reset Zoom button to the top-right corner.
+        btn = self._unzoom_btn
+        margin = 6
+        btn.adjustSize()
+        btn.move(self.width() - btn.width() - margin, margin)
+        super().resizeEvent(event)
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
@@ -137,6 +303,9 @@ class VideoPanelWidget(QWidget):
             self.frameSeekRequested.emit(self._current_frame + 1)
         elif key == Qt.Key_Left:
             self.frameSeekRequested.emit(self._current_frame - 1)
+        elif key == Qt.Key_0 and (event.modifiers() & Qt.ControlModifier):
+            # Ctrl+0 = reset zoom (mirrors browser convention).
+            self.reset_zoom()
         else:
             super().keyPressEvent(event)
 

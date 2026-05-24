@@ -25,3 +25,28 @@ def get_identity_color(identity_id: int | None, fallback_track_idx: int | None =
 
 def next_palette_color(n_existing: int) -> str:
     return TRACK_COLORS[n_existing % len(TRACK_COLORS)]
+
+
+# Camera palette — distinct from TRACK_COLORS so cameras don't visually
+# collide with tracks/identities when both are on screen. Used by
+# graph_window.py (node colors in "Color by Camera" mode) and view_strip.py
+# (side-bar swatches).
+CAMERA_COLORS = [
+    "#1b9e77",  # teal
+    "#d95f02",  # orange
+    "#7570b3",  # indigo
+    "#e7298a",  # pink
+    "#66a61e",  # leaf green
+    "#e6ab02",  # gold
+    "#a6761d",  # brown
+    "#1f77b4",  # blue
+]
+
+
+def get_camera_color(camera_idx: int | None) -> str:
+    """Stable color for a camera identified by its loader-order index.
+    Wraps modulo CAMERA_COLORS so sessions with more cameras than entries
+    still render (colors repeat)."""
+    if camera_idx is None or camera_idx < 0:
+        return "#888888"
+    return CAMERA_COLORS[camera_idx % len(CAMERA_COLORS)]

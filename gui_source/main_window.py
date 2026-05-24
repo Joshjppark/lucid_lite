@@ -1,4 +1,11 @@
-"""LUCID-Lite main window — assembles the camera grid, timeline, and assignment sidebar."""
+"""LUCID-Lite main window — assembles the camera dock area, view strip,
+timeline, and assignment sidebar.
+
+The video panels live inside a NESTED QMainWindow whose dock system gives
+us close / drag-rearrange / drag-to-tabify / drag-to-float for free —
+matching luc3d's Dockview pane manager. The outer main window keeps the
+left view strip and the right assignment sidebar around that nested area.
+"""
 from __future__ import annotations
 
 import math
@@ -7,8 +14,8 @@ from pathlib import Path
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
-    QFileDialog, QGridLayout, QHBoxLayout, QMainWindow, QMessageBox,
-    QSplitter, QTabBar, QVBoxLayout, QWidget,
+    QDockWidget, QFileDialog, QHBoxLayout, QMainWindow, QMessageBox,
+    QSplitter, QTabBar, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from assignment_panel import IdentityAssignmentPanel
@@ -16,6 +23,7 @@ from playback_controls import PlaybackControls
 from pose_data import Session
 from timeline_widget import TimelineWidget
 from video_panel import VideoPanelWidget
+from view_strip import ViewStripWidget
 
 SIDEBAR_DEFAULT_WIDTH = 320
 SIDEBAR_MIN_WIDTH = 260
@@ -36,7 +44,11 @@ class LucidLiteWindow(QMainWindow):
 
         self.session = session
         self._current_frame = session.min_frame
+        # Bookkeeping: panels live inside dock widgets so they survive a
+        # close (the dock just hides) and can be re-shown via the view
+        # strip. Both maps stay in sync, keyed by camera name.
         self._video_panels: dict[str, VideoPanelWidget] = {}
+        self._video_docks: dict[str, QDockWidget] = {}
 
         self._build_central()
         self._add_menus()
@@ -56,26 +68,49 @@ class LucidLiteWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
+        # ----- Horizontal split: [view strip | docked videos | assignment]
         splitter = QSplitter(Qt.Horizontal, central)
         splitter.setObjectName("main_hsplit")
         splitter.setChildrenCollapsible(False)
 
-        grid_container = QWidget(splitter)
-        grid_container.setObjectName("video_grid_container")
-        grid_layout = QGridLayout(grid_container)
-        grid_layout.setObjectName("video_grid")
-        grid_layout.setContentsMargins(0, 0, 0, 0)
-        grid_layout.setSpacing(2)
-        self._build_video_grid(grid_layout)
+        # Left view strip (small icon + cam name).
+        self.view_strip = ViewStripWidget(self.session, splitter)
+        self.view_strip.setObjectName("view_strip")
+        self.view_strip.viewActivated.connect(self._activate_view)
 
+        # Center: nested QMainWindow whose dock system owns the video tabs.
+        # Setting an empty/zero-size central widget lets the docks fill the
+        # entire surface; setDockNestingEnabled allows users to splitand
+        # tabify by dragging the dock title bars.
+        self._video_host = QMainWindow(splitter)
+        self._video_host.setObjectName("video_dock_host")
+        self._video_host.setDockNestingEnabled(True)
+        self._video_host.setDockOptions(
+            QMainWindow.AnimatedDocks
+            | QMainWindow.AllowNestedDocks
+            | QMainWindow.AllowTabbedDocks
+            | QMainWindow.GroupedDragging
+        )
+        # Tabs along the top so they look like browser tabs (closest match
+        # to luc3d's Dockview style).
+        self._video_host.setTabPosition(Qt.AllDockWidgetAreas, QTabWidget.North)
+        host_placeholder = QWidget(self._video_host)
+        host_placeholder.setMaximumSize(0, 0)
+        self._video_host.setCentralWidget(host_placeholder)
+        self._build_video_docks()
+
+        # Right side: identity assignment panel (unchanged).
         self.assignment = IdentityAssignmentPanel(self.session, splitter)
         self.assignment.setObjectName("assignment_panel")
         self.assignment.setMinimumWidth(SIDEBAR_MIN_WIDTH)
 
-        splitter.addWidget(grid_container)
+        splitter.addWidget(self.view_strip)
+        splitter.addWidget(self._video_host)
         splitter.addWidget(self.assignment)
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 1)
+        # Stretch: view strip fixed, dock host grows, assignment fixed-ish.
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 5)
+        splitter.setStretchFactor(2, 1)
 
         timeline_container = QWidget()
         timeline_container.setObjectName("timeline_container")
@@ -137,22 +172,73 @@ class LucidLiteWindow(QMainWindow):
                 return float(fps)
         return 30.0
 
-    def _build_video_grid(self, grid: QGridLayout) -> None:
+    def _build_video_docks(self) -> None:
+        """Wrap each camera's VideoPanelWidget in a QDockWidget and arrange
+        them in a grid via splitDockWidget. After the initial arrangement,
+        the user can:
+          * close any dock (X in the title bar) — view strip dims its row
+          * drag a dock title to rearrange / split
+          * drag a dock onto another dock's title bar to tabify them
+          * drag a dock outside the main window to float it
+        """
         cam_names = self.session.camera_names()
         n = len(cam_names)
         if n == 0:
             return
         rows, cols = self._grid_dims(n)
+
+        # Make dock widgets first so we have stable references for the
+        # splitDockWidget calls below.
+        grid: dict[tuple[int, int], QDockWidget] = {}
         for i, cam_name in enumerate(cam_names):
-            panel = VideoPanelWidget(self.session, cam_name, parent=self)
+            panel = VideoPanelWidget(self.session, cam_name, parent=self._video_host)
             panel.frameSeekRequested.connect(self.set_current_frame)
             self._video_panels[cam_name] = panel
+
+            dock = QDockWidget(cam_name, self._video_host)
+            dock.setObjectName(f"video_dock::{cam_name}")
+            dock.setWidget(panel)
+            dock.setFeatures(
+                QDockWidget.DockWidgetClosable
+                | QDockWidget.DockWidgetMovable
+                | QDockWidget.DockWidgetFloatable
+            )
+            dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+            # Wire visibility → view strip dim/un-dim, and raise → active
+            # row highlight in the strip. visibilityChanged also fires when
+            # the dock is tabbed-behind another, so it doubles as a sync
+            # signal for the strip.
+            dock.visibilityChanged.connect(
+                lambda visible, c=cam_name: self._on_dock_visibility_changed(c, visible)
+            )
+            self._video_docks[cam_name] = dock
             r, c = divmod(i, cols)
-            grid.addWidget(panel, r, c)
-        for r in range(rows):
-            grid.setRowStretch(r, 1)
-        for c in range(cols):
-            grid.setColumnStretch(c, 1)
+            grid[(r, c)] = dock
+
+        # Anchor the (0, 0) dock in the right dock area — Qt requires at
+        # least one addDockWidget call before splitDockWidget will work.
+        self._video_host.addDockWidget(Qt.RightDockWidgetArea, grid[(0, 0)])
+
+        # First row: split horizontally off (0, c-1).
+        for c in range(1, cols):
+            if (0, c) in grid:
+                self._video_host.splitDockWidget(
+                    grid[(0, c - 1)], grid[(0, c)], Qt.Horizontal
+                )
+
+        # Subsequent rows: each row's first cell splits vertically off the
+        # row above's first cell; the rest split horizontally off the
+        # previous cell in the same row.
+        for r in range(1, rows):
+            if (r, 0) in grid:
+                self._video_host.splitDockWidget(
+                    grid[(r - 1, 0)], grid[(r, 0)], Qt.Vertical
+                )
+            for c in range(1, cols):
+                if (r, c) in grid:
+                    self._video_host.splitDockWidget(
+                        grid[(r, c - 1)], grid[(r, c)], Qt.Horizontal
+                    )
 
     @staticmethod
     def _grid_dims(n: int) -> tuple[int, int]:
@@ -160,18 +246,48 @@ class LucidLiteWindow(QMainWindow):
         rows = math.ceil(n / cols)
         return rows, cols
 
+    # ---- view-strip / dock coordination -------------------------------
+
+    def _on_dock_visibility_changed(self, cam_name: str, visible: bool) -> None:
+        """Update the view strip when a dock is shown / hidden / tabbed."""
+        if hasattr(self, "view_strip"):
+            self.view_strip.set_view_visible(cam_name, visible)
+
+    def _activate_view(self, cam_name: str) -> None:
+        """Show + raise the camera's dock — called when the user clicks a
+        view-strip row. If the dock was closed (`isVisible() == False`),
+        show it again; otherwise just bring it to the front of its tab
+        group."""
+        dock = self._video_docks.get(cam_name)
+        if dock is None:
+            return
+        if not dock.isVisible():
+            dock.show()
+        # Pull this dock to the top of any tab group it shares, and give
+        # it keyboard focus so arrow keys go to the right panel.
+        dock.raise_()
+        panel = self._video_panels.get(cam_name)
+        if panel is not None:
+            panel.setFocus(Qt.MouseFocusReason)
+
     def _size_to_screen(self) -> None:
+        # 3-pane splitter sizes: [view strip | dock host | assignment].
+        # View strip is fixed-ish (~120 px), assignment ~320, dock host gets
+        # the rest.
+        VS = 120
         screen = QGuiApplication.primaryScreen()
         if screen is None:
             self.resize(1600, 1000)
-            self._splitter.setSizes([1600 - SIDEBAR_DEFAULT_WIDTH, SIDEBAR_DEFAULT_WIDTH])
+            self._splitter.setSizes(
+                [VS, 1600 - VS - SIDEBAR_DEFAULT_WIDTH, SIDEBAR_DEFAULT_WIDTH]
+            )
             self._v_splitter.setSizes([1000 - TIMELINE_DEFAULT_HEIGHT, TIMELINE_DEFAULT_HEIGHT])
             return
         geom = screen.availableGeometry()
         self.resize(geom.size())
         self.move(geom.topLeft())
-        target_left = max(0, geom.width() - SIDEBAR_DEFAULT_WIDTH)
-        self._splitter.setSizes([target_left, SIDEBAR_DEFAULT_WIDTH])
+        center_w = max(200, geom.width() - VS - SIDEBAR_DEFAULT_WIDTH)
+        self._splitter.setSizes([VS, center_w, SIDEBAR_DEFAULT_WIDTH])
         top_h = max(TIMELINE_MIN_HEIGHT + 100,
                     geom.height() - TIMELINE_DEFAULT_HEIGHT)
         self._v_splitter.setSizes([top_h, TIMELINE_DEFAULT_HEIGHT])
