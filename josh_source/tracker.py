@@ -150,16 +150,28 @@ class SingleFrameTrack:
         self.frame_idx = fg.frame_idx
         self.proj_cache = proj_cache
         self.node_weights = np.array(list(node_weights.values()))
+
+
+        # attributes to be updated a future time
         self._camera_pairs = None
-        self.EPIPOLE_THRESHOLD = 10
+        self.adjacency_matrix = None
+        self.edges = None
+        self.groups = None
+        self.bad_instances = []
+        self.match_conflicts = []
 
 
         self.cam_count_dict: dict[str, int] = {cam: len(insts) for cam, insts in fg.instances.items()}
         self.cameras = [c for c in cameras if self.cam_count_dict.get(c.name, 0)]
         self.cam_map = {c.name: c for c in self.cameras}
 
+        # hyper parameters
+        self.EPIPOLE_THRESHOLD = 10
+        self.MIN_NODES = 3
 
-        instance_by_cam, inst_list = self.get_instance_dict(fg)
+
+        # save instances to dict and list
+        instance_by_cam, inst_list = self.get_instances(fg)
         self.n_insts = len(inst_list)
         self.instance_by_cam: dict[tuple[int, np.ndarray]] = instance_by_cam
         # key: cam name
@@ -168,14 +180,15 @@ class SingleFrameTrack:
         self.instance_list: list[tuple[int, str, np.ndarray]] = inst_list
         # (track idx, cam name, points: np.ndarray)
 
-        self.adjacency_matrix = np.full((self.n_insts, self.n_insts), np.inf)
-        # self._calc_edge_weights()
-        # self._get_groups()
+
+        # run the tracking algorithm    
+        self._runSingleFrameTracker()
 
     
-    def get_instance_dict(self, fg):
+    def get_instances(self, fg):
 
         
+        # make a mask to remove zeros in the node_weights - reduces computation
         bool_mask = self.node_weights != 0
         self.node_weights = self.node_weights[bool_mask]
 
@@ -191,6 +204,12 @@ class SingleFrameTrack:
                 pts = cv2.undistortPoints(pts, K, np.array(self.cam_map[cam_name].dist), P=K).squeeze(1)
                 pts = pts[bool_mask]
 
+                # check number of valid nodes
+                num_valid_nodes = np.sum(~np.isnan(pts).any(axis=1))
+
+                if num_valid_nodes < self.MIN_NODES:
+                    self.bad_instances.append((inst.track_idx, cam_name, pts))
+                    continue
 
                 instance_list.append((inst.track_idx, cam_name, pts))
                 cam_points.append((counter, pts))
@@ -201,6 +220,35 @@ class SingleFrameTrack:
 
         return instance_by_cam, instance_list
     
+
+    def _runSingleFrameTracker(self):
+                               
+        self.adjacency_matrix = np.full((self.n_insts, self.n_insts), np.inf)
+        self.edges = self._calc_edge_weights()
+        self.groups = self._run_bfs()
+
+
+    def smart_hungarian(self, edges):
+        mask = edges < self.EPIPOLE_THRESHOLD
+        row_counts = mask.sum(axis=1)
+        col_counts = mask.sum(axis=0)
+
+        match_conflicts = []
+
+        # row collision
+        for r in np.where(row_counts > 1)[0]:
+            c_indices = np.where(mask[r, :])[0]
+            match_conflicts.append(np.column_stack((np.full(len(c_indices), r), c_indices)))
+
+        # columns collisions
+        for c in np.where(col_counts > 1)[0]:
+            r_indices = np.where(mask[:, c])[0]
+            match_conflicts.append(np.column_stack((r_indices, np.full(len(r_indices), c))))
+
+        matches = mask & (row_counts == 1) & (col_counts == 1)
+        matches = np.column_stack(np.where(matches))
+
+        return matches, match_conflicts
 
 
     def _calc_edge_weights(self):
@@ -219,7 +267,14 @@ class SingleFrameTrack:
             # save edges
 
             # run hungarian
-            rows, cols = linear_sum_assignment(edges)
+            # rows, cols = linear_sum_assignment(edges)
+
+
+            # run 'smart' hungarian
+            matches, match_conflicts = self.smart_hungarian(edges)
+            self.match_conflicts.append(match_conflicts)
+
+
             # print(f'calculated edges with cams {cam1}, {cam2}')
 
             # add row and column assignments from edge hungarian to the adjacency matrix
@@ -240,7 +295,7 @@ class SingleFrameTrack:
 
                     raise AssertionError
 
-        self.edges = edge_dict
+        return edge_dict
 
 
     def _calc_edge(self, cam1: Camera, cam2: Camera) -> np.ndarray:
@@ -306,7 +361,7 @@ class SingleFrameTrack:
     
 
 
-    def visualize_epipolar_pair(self, window, cam1_name, cam2_name, track_idx: tuple | int):
+    def visualize_epipolar_pair(self, window, cam1_name, cam2_name, track_idx: tuple):
 
         '''
         Draws a 1x2 grid, where each row has the two cameras and
@@ -314,9 +369,9 @@ class SingleFrameTrack:
 
         sample use:
         '''
-        if type(track_idx) == int:
-            track1_idx, track2_idx = track_idx, track_idx    
-        elif type(track_idx) == tuple:
+        if len(track_idx) == 1:
+            track1_idx, track2_idx = track_idx[0], track_idx[0]
+        elif len(track_idx) == 2:
             track1_idx, track2_idx = track_idx
         else:
             raise AssertionError
@@ -411,7 +466,11 @@ class SingleFrameTrack:
         self._camera_pairs = cam_pairs
         return self._camera_pairs
 
-    
+
+    @property
+    def valid(self):
+        return all([group.valid for group in self.groups])
+
     
     def __repr__(self):
         return f'{self.cam_count_dict}'

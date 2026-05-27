@@ -5,6 +5,8 @@ Mirrors the feature scope described in prompts/plans/lucid-lite.md §5.
 """
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
@@ -73,10 +75,12 @@ class IdentityAssignmentPanel(QWidget):
         # Tree layout: camera names are top-level nodes (bold), tracks at
         # that frame are indented children. Column 0 holds the camera name
         # at the top level and "track_idx (track_name)" at the leaf level.
-        # Identity combo lives in column 1, scope text in column 2.
+        # Identity combo lives in column 1; column 2 ("Points") shows how
+        # many of the skeleton's nodes are visible for that track's instance
+        # at this frame.
         self.tree = QTreeWidget()
         self.tree.setColumnCount(3)
-        self.tree.setHeaderLabels(["Camera / Track", "Identity", "Scope"])
+        self.tree.setHeaderLabels(["Camera / Track", "Identity", "Points"])
         self.tree.setRootIsDecorated(True)
         self.tree.setIndentation(16)
         self.tree.setUniformRowHeights(True)
@@ -255,15 +259,25 @@ class IdentityAssignmentPanel(QWidget):
                 self.tree.addTopLevelItem(cam_item)
                 cam_item.setExpanded(True)
 
-                # Unique tracks visible in this camera at the current frame.
-                tracks_here: list[int] = []
+                # Unique tracks visible in this camera at the current frame,
+                # paired with their (visible, total) node counts. One pass
+                # over the camera's instances handles both — `track_to_points`
+                # preserves insertion order so `tracks_here` keeps the
+                # original ordering from `get_instances`.
+                track_to_points: dict[int, tuple[int, int]] = {}
                 if fg is not None:
-                    seen: set[int] = set()
                     for inst in fg.get_instances(cam_name):
-                        if inst.track_idx is None or inst.track_idx in seen:
+                        if inst.track_idx is None or inst.track_idx in track_to_points:
                             continue
-                        seen.add(inst.track_idx)
-                        tracks_here.append(inst.track_idx)
+                        n_total = len(inst.points)
+                        n_visible = sum(
+                            1 for pt in inst.points
+                            if pt is not None
+                            and math.isfinite(pt[0])
+                            and math.isfinite(pt[1])
+                        )
+                        track_to_points[inst.track_idx] = (n_visible, n_total)
+                tracks_here: list[int] = list(track_to_points.keys())
 
                 if not tracks_here:
                     # Reserve visual space under empty cameras with a muted
@@ -301,14 +315,18 @@ class IdentityAssignmentPanel(QWidget):
                     )
                     self.tree.setItemWidget(track_item, 1, combo)
 
-                    # Scope: per-frame override vs global.
-                    per_key = f"{self._current_frame}:{cam_name}:{track_idx}"
-                    scope = (
-                        "frame"
-                        if per_key in self.session.frame_identity_map
-                        else "global"
+                    # Points: how many of the skeleton's nodes have a
+                    # finite (x, y) for this track's instance at this frame.
+                    # Tooltip carries the "visible / total" context so the
+                    # cell stays compact.
+                    n_visible, n_total = track_to_points.get(track_idx, (0, 0))
+                    track_item.setText(2, str(n_visible))
+                    track_item.setToolTip(
+                        2, f"{n_visible} of {n_total} skeleton nodes visible"
                     )
-                    track_item.setText(2, scope)
+                    track_item.setTextAlignment(
+                        2, Qt.AlignRight | Qt.AlignVCenter
+                    )
 
                     # Identity color swatch behind the track label.
                     ident = self.session.get_identity(effective_id)

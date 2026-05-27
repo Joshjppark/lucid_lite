@@ -17,7 +17,7 @@ from video_decoder import DecodeWorker, OnDemandVideoDecoder
 # without overshooting.
 _ZOOM_MIN = 0.5
 _ZOOM_MAX = 20.0
-_ZOOM_STEP = 1.15
+_ZOOM_STEP = 1.05
 
 
 class VideoPanelWidget(QWidget):
