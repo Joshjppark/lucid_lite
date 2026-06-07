@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QPushButton, QWidget
 
 import overlay_renderer
 from pose_data import Session
-from video_decoder import DecodeWorker, OnDemandVideoDecoder
+from video_decoder import FrameLoaderThread, OnDemandVideoDecoder, probe_video_metadata
 
 # Zoom limits (multiplicative). 0.5×–20× covers "fit to panel zoomed out" to
 # "single-pixel inspection". Wheel step is 1.15× per notch — feels natural
@@ -32,17 +32,30 @@ class VideoPanelWidget(QWidget):
         self._video_w: int = 0
         self._video_h: int = 0
 
-        # Open video decoder if we have a path.
+        # One independent loader per camera. Each FrameLoaderThread owns
+        # a PyAV container on its own thread, with a coalescing request
+        # queue so playback bursts collapse to "latest frame wins"
+        # instead of queueing decode work that will be thrown away.
         video_path = session.video_paths.get(camera_name)
-        self._decoder: OnDemandVideoDecoder | None = None
-        self._worker: DecodeWorker | None = None
+        self._loader: FrameLoaderThread | None = None
+        # Lazy synchronous decoder for debug/notebook visualization calls
+        # (e.g. tracker.visualize_epipolar_pair). PyAV containers aren't
+        # thread-safe to share with the loader, so this is a separate
+        # container owned by the GUI thread.
+        self._sync_decoder: OnDemandVideoDecoder | None = None
+        self._fps: float | None = None
         if video_path is not None:
             try:
-                self._decoder = OnDemandVideoDecoder(video_path)
-                self._video_w = self._decoder.width
-                self._video_h = self._decoder.height
-                self._worker = DecodeWorker(self._decoder, self)
-                self._worker.frame_ready.connect(self._on_frame_ready)
+                # Probe metadata up-front from the GUI thread so we can
+                # size the panel + report FPS without cross-thread access
+                # to the loader's decoder.
+                w, h, fps, _ = probe_video_metadata(video_path)
+                self._video_w = w
+                self._video_h = h
+                self._fps = fps
+                self._loader = FrameLoaderThread(video_path, parent=self)
+                self._loader.frame_ready.connect(self._on_frame_ready)
+                self._loader.start()
             except Exception as exc:
                 print(f"[{camera_name}] failed to open {video_path}: {exc}")
 
@@ -100,10 +113,8 @@ class VideoPanelWidget(QWidget):
 
     @property
     def fps(self) -> float | None:
-        """Video FPS from the decoder, or None if no video opened."""
-        if self._decoder is None:
-            return None
-        return float(self._decoder.fps) if self._decoder.fps else None
+        """Video FPS, or None if no video opened."""
+        return self._fps
 
     def set_current_frame(self, frame_idx: int) -> None:
         if frame_idx == self._current_frame:
@@ -115,15 +126,40 @@ class VideoPanelWidget(QWidget):
     # ---- decoder plumbing --------------------------------------------
 
     def _request_frame(self, frame_idx: int) -> None:
-        if self._worker is None:
+        if self._loader is None:
             return
-        self._worker.request(frame_idx)
+        self._loader.request(frame_idx)
 
     def _on_frame_ready(self, frame_idx: int, image: QImage) -> None:
         if frame_idx != self._current_frame:
             return
         self._pixmap = QPixmap.fromImage(image)
         self.update()
+
+    def get_frame_sync(self, frame_idx: int) -> QImage | None:
+        """Synchronously decode a frame for debug/visualization callers.
+
+        The async FrameLoaderThread owns the playback decoder on its own
+        thread; PyAV containers aren't thread-safe to share, so this
+        opens a separate decoder lazily on first use. Suitable for
+        notebook visualizations (e.g. tracker.visualize_epipolar_pair),
+        not for the rendering hot path.
+        """
+        # Resolve the path from session.video_paths each call rather than
+        # caching on self in __init__ — this way live instances reloaded
+        # via %autoreload still work even if __init__ didn't re-run.
+        sync = getattr(self, "_sync_decoder", None)
+        if sync is None:
+            video_path = self.session.video_paths.get(self.camera_name)
+            if video_path is None:
+                return None
+            try:
+                sync = OnDemandVideoDecoder(video_path)
+            except Exception as exc:
+                print(f"[{self.camera_name}] sync decoder open failed: {exc}")
+                return None
+            self._sync_decoder = sync
+        return sync.get_frame(int(frame_idx))
 
     # ---- rendering ----------------------------------------------------
 
@@ -214,17 +250,25 @@ class VideoPanelWidget(QWidget):
         self._pan_y = s * self._pan_y + (1.0 - s) * (py - cy)
         self._zoom = new_zoom
 
+        # Zooming out shrinks the legal pan range — clamp before paint so
+        # the video edges don't reveal the panel background as the user
+        # rolls the wheel back toward 1×.
+        self._clamp_pan()
         self._update_unzoom_btn()
         self.update()
         event.accept()
 
     def mousePressEvent(self, event) -> None:
-        # Right-click drag OR Shift+left-click drag = pan. Plain left-click
-        # is reserved so future selection / drag-instance work can hook in.
+        # Plain left-click drags the video while zoomed in. Right-click
+        # and Shift+left-click also pan (kept so muscle memory survives).
+        # At 1× there's nothing to pan, so plain left-click falls through
+        # to default handling — future selection / drag-instance work can
+        # hook in there.
         is_pan = (
             event.button() == Qt.RightButton
             or (event.button() == Qt.LeftButton
-                and event.modifiers() & Qt.ShiftModifier)
+                and (event.modifiers() & Qt.ShiftModifier
+                     or self._zoom > 1.0))
         )
         if is_pan:
             self._panning = True
@@ -243,11 +287,37 @@ class VideoPanelWidget(QWidget):
             pos = event.position()
             self._pan_x = self._pan_start_x + (pos.x() - self._pan_grab_x)
             self._pan_y = self._pan_start_y + (pos.y() - self._pan_grab_y)
+            # Stop the user from dragging past the video edges. The clamp
+            # uses the current letterbox + zoom to bound pan; once a
+            # bound is hit the cursor can keep moving but the video sits
+            # still until the user reverses direction.
+            self._clamp_pan()
             self._update_unzoom_btn()
             self.update()
             event.accept()
             return
         super().mouseMoveEvent(event)
+
+    def _clamp_pan(self) -> None:
+        """Constrain `_pan_x` / `_pan_y` so the scaled video stays inside
+        the letterbox rect (no panel-background gap at any edge).
+
+        Derivation: the paintEvent transform is
+            P' = T(pan) · T(c) · S(zoom) · T(-c) · P
+        so the scaled letterbox rect spans W·zoom × H·zoom around the
+        letterbox center, shifted by `pan`. For the scaled rect to keep
+        covering the original W × H letterbox at every edge we need
+            |pan_x| ≤ W·(zoom-1)/2,
+            |pan_y| ≤ H·(zoom-1)/2.
+        At zoom ≤ 1 the bound is non-positive — there's no room to pan
+        so we snap to 0, which is what holds the video centered when
+        zoomed out.
+        """
+        rect = _letterbox(self._video_w, self._video_h, self.width(), self.height())
+        max_pan_x = max(0.0, rect.width() * (self._zoom - 1.0) / 2.0)
+        max_pan_y = max(0.0, rect.height() * (self._zoom - 1.0) / 2.0)
+        self._pan_x = max(-max_pan_x, min(max_pan_x, self._pan_x))
+        self._pan_y = max(-max_pan_y, min(max_pan_y, self._pan_y))
 
     def mouseReleaseEvent(self, event) -> None:
         if self._panning and event.button() in (Qt.RightButton, Qt.LeftButton):
@@ -295,23 +365,31 @@ class VideoPanelWidget(QWidget):
         margin = 6
         btn.adjustSize()
         btn.move(self.width() - btn.width() - margin, margin)
+        # Shrinking the panel shrinks the legal pan range; re-clamp so
+        # the video edges don't expose the background after a resize.
+        self._clamp_pan()
         super().resizeEvent(event)
 
     def keyPressEvent(self, event) -> None:
-        key = event.key()
-        if key == Qt.Key_Right:
-            self.frameSeekRequested.emit(self._current_frame + 1)
-        elif key == Qt.Key_Left:
-            self.frameSeekRequested.emit(self._current_frame - 1)
-        elif key == Qt.Key_0 and (event.modifiers() & Qt.ControlModifier):
+        # Arrow keys are routed through LucidLiteWindow's application-wide
+        # Right/Left QShortcuts; this widget only handles its own zoom reset.
+        if event.key() == Qt.Key_0 and (event.modifiers() & Qt.ControlModifier):
             # Ctrl+0 = reset zoom (mirrors browser convention).
             self.reset_zoom()
         else:
             super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:
-        if self._decoder is not None:
-            self._decoder.close()
+        # Tear down the loader thread + its decoder. stop() blocks
+        # briefly for the worker to exit so we don't leak the PyAV
+        # container or have signals firing into a dead widget.
+        if self._loader is not None:
+            self._loader.stop()
+            self._loader = None
+        sync = getattr(self, "_sync_decoder", None)
+        if sync is not None:
+            sync.close()
+            self._sync_decoder = None
         super().closeEvent(event)
 
 

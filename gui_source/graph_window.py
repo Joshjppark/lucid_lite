@@ -33,11 +33,14 @@ Layout strategy:
 
 Display panel (right side):
     * "Weights" toggle — show / hide edge-weight numeric labels.
-    * "Id" section — one toggle per identity group at the rendered frame.
-      Turning a group off removes its nodes AND any edges that involve
-      those nodes (and therefore their weight labels).
-    * Toggle state is reset when the frame changes; preserved on same-
-      frame redraws (including ones triggered by groups_changed).
+    * "Id" section — one toggle per identity in `sft.trackIds` at the
+      rendered frame (ordered by stable identity_id). Turning an
+      identity off removes its nodes AND any edges that involve those
+      nodes (and therefore their weight labels). Hidden identities
+      (group=None this frame) show up as disabled rows tagged "(hidden)".
+    * Toggle state is keyed by identity_id and persisted per-frame, so
+      an identity that vanishes for a frame and comes back keeps its
+      visibility.
 
 Tracker coupling:
     * This file does NOT import from josh_source.tracker — Group objects
@@ -98,33 +101,49 @@ class GroupGraphWindow(QDialog):
         self.session = session
         self._frame_idx: int = int(initial_frame)
 
-        # Display-panel state — preserved across same-frame redraws.
+        # Display-panel state — global, not per-frame. These describe
+        # *how* to render, not *what* the user has customized on a given
+        # frame, so they survive frame navigation as-is.
         self._show_weights: bool = True
         # False = color nodes by identity (group_idx → identity color),
         # edges colored to match. True = color nodes by camera, edges
         # rendered neutral gray (cameras don't have inter-camera identity
         # by definition, so a coloured edge would be meaningless).
         self._color_by_camera: bool = False
-        self._visible_groups: set[int] = set()
-        # Identity rows whose per-view reprojection-score breakdown is
-        # currently expanded. Reset on frame change / group cardinality
-        # change (see `_refresh`); preserved across toggle redraws.
-        self._expanded_groups: set[int] = set()
-        # Tracks last-rendered frame + group count so we know when to reset
-        # `_visible_groups` (new frame OR cardinality changed → reset to all).
-        self._last_rendered_frame: Optional[int] = None
-        self._last_group_count: int = -1
 
-        # ---- node-drag state ------------------------------------------
-        # Per-frame user-stashed positions in data coordinates. Survives
-        # redraws (color-mode flips, toggle changes, re-pushes) and frame
-        # navigations. Keyed by (frame_idx, (cam, track)). Empty until the
-        # user drags. Reset per-frame via the "Reset Layout" button.
-        self._node_positions: dict[int, dict[tuple[str, int], np.ndarray]] = {}
-        # Set during _draw so the mouse handlers can hit-test against the
-        # actual rendered positions (which may be polygon defaults or user
-        # overrides). Keyed by (cam, track).
+        # ---- per-frame visual cache ----------------------------------
+        # Four parallel dicts keyed by frame_idx. They hold whatever the
+        # user has customized at that frame and persist across frame
+        # navigation, group re-pushes that preserve topology, and
+        # window close/reopen (in-memory; lives with the dialog).
+        #
+        # Cache values are keyed by *stable identity_id* (from
+        # sft.trackIds), so an identity that disappears for a frame and
+        # then comes back retains its toggle/expand state automatically.
+        # The disabled-edges cache is keyed by frozenset({(cam, t),
+        # (cam, t)}), also stable across re-pushes.
+        #
+        # Memory: only frames the user actively customized end up in
+        # these dicts — unedited frames hit the default branch at draw
+        # time and never allocate an entry.
+        self._cached_visible_identities: dict[int, set[int]] = {}
+        self._cached_expanded_identities: dict[int, set[int]] = {}
+        self._cached_disabled_edges: dict[int, set[frozenset]] = {}
+        self._cached_node_positions: dict[int, dict[tuple[str, int], np.ndarray]] = {}
+
+        # Working copies for the currently rendered frame. Populated in
+        # `_refresh` from the per-frame cache (or defaults if absent);
+        # the toggle handlers mutate these and persist back to the cache.
+        self._visible_identities: set[int] = set()
+        self._expanded_identities: set[int] = set()
+
+        # ---- transient render-time stashes (not cached) --------------
+        # Set during _draw so the mouse handlers can hit-test against
+        # the actual rendered positions. Keyed by (cam, track) /
+        # frozenset({(cam,t), (cam,t)}). Re-populated every _draw call.
         self._current_node_pos: dict[tuple[str, int], np.ndarray] = {}
+        self._current_edges: dict[frozenset, tuple[np.ndarray, np.ndarray]] = {}
+
         # Drag bookkeeping.
         self._drag_node: Optional[tuple[str, int]] = None
         self._drag_offset: Optional[np.ndarray] = None
@@ -196,6 +215,14 @@ class GroupGraphWindow(QDialog):
 
         # Live updates: groups_changed fires after any push_frame_assignments.
         session.groups_changed.connect(self._refresh)
+
+        # Follow the main window's playhead so arrow keys + space-bar
+        # playback (registered as application-wide QShortcuts on the
+        # main window) keep the graph view in sync without having to
+        # re-implement the keybindings here. Same approach as
+        # Triangulation3DWindow. `parent` is the LucidLiteWindow.
+        if parent is not None and hasattr(parent, "currentFrameChanged"):
+            parent.currentFrameChanged.connect(self.set_frame)
 
         self._refresh()
 
@@ -269,9 +296,31 @@ class GroupGraphWindow(QDialog):
 
         return panel
 
-    def _rebuild_display_panel(self, groups: list) -> None:
+    def _ident_pairs(self, groups: list, trackIds) -> list[tuple[int, object]]:
+        """Return ordered (identity_id, Group | None) pairs to render.
+
+        Source of truth is `sft.trackIds` (dict[identity_id ->
+        TrackedIdentity]). Each TrackedIdentity holds the Group object
+        it owns this frame, or None if the identity is occluded.
+
+        Falls back to using positional g_idx as the identity when the
+        bundle predates trackIds (or trackIds is None on an invalid
+        frame). In that case all entries have a non-None group.
+
+        Ordered by identity_id so the display panel stays stable across
+        frames (an identity that vanishes for one frame and comes back
+        slots back into the same row).
+        """
+        if trackIds:
+            return [
+                (int(ident_id), getattr(ti, "group", None))
+                for ident_id, ti in sorted(trackIds.items())
+            ]
+        return [(g_idx, g) for g_idx, g in enumerate(groups)]
+
+    def _rebuild_display_panel(self, groups: list, trackIds=None) -> None:
         """Repopulate the toggle rows based on the groups list. Restores
-        toggle state from `self._show_weights` / `self._visible_groups`.
+        toggle state from `self._show_weights` / `self._visible_identities`.
         """
         # Clear existing rows. QLayout.takeAt(0) + deleteLater is the safe
         # idiom for fully clearing a parented layout.
@@ -349,10 +398,14 @@ class GroupGraphWindow(QDialog):
         id_header.setStyleSheet("font-weight: bold;")
         self._display_body_layout.addWidget(id_header)
 
-        for g_idx in range(len(groups)):
-            group = groups[g_idx]
-            scores = _read_reproj_scores(group)
+        # Iterate identities directly from sft.trackIds. Hidden
+        # identities (group is None) get a dimmed row so the user sees
+        # the full identity set, but their checkbox/expand are inert
+        # since they contribute no nodes this frame.
+        for ident_id, group in self._ident_pairs(groups, trackIds):
+            scores = _read_reproj_scores(group) if group is not None else {}
             avg = _avg_reproj_score(scores)
+            is_hidden = group is None
 
             # Container wraps top-row + (collapsed-by-default) detail panel.
             container = QWidget()
@@ -366,24 +419,29 @@ class GroupGraphWindow(QDialog):
             rl.setContentsMargins(0, 0, 0, 0)
             rl.setSpacing(4)
 
-            color = _identity_color(self.session, g_idx)
+            color = _identity_color(self.session, ident_id)
             swatch = QLabel()
             swatch.setFixedSize(14, 14)
             swatch.setStyleSheet(
                 f"background-color: {color}; "
                 f"border: 1px solid #444; border-radius: 2px;"
+                + (" opacity: 0.4;" if is_hidden else "")
             )
             rl.addWidget(swatch)
 
-            ident = self.session.get_identity(g_idx)
-            name = ident.name if ident is not None else f"id_{g_idx}"
-            chk = QCheckBox(name)
-            chk.setChecked(g_idx in self._visible_groups)
+            ident = self.session.get_identity(ident_id)
+            base_name = ident.name if ident is not None else f"id_{ident_id}"
+            label = f"{base_name} (hidden)" if is_hidden else base_name
+            chk = QCheckBox(label)
+            chk.setChecked(ident_id in self._visible_identities)
+            chk.setEnabled(not is_hidden)
             chk.toggled.connect(
-                lambda checked, gi=g_idx: self._on_group_toggled(gi, checked)
+                lambda checked, ii=ident_id: self._on_identity_toggled(ii, checked)
             )
             chk.setToolTip(
-                f"Toggle visibility of group {g_idx} (nodes + edges + weights)"
+                f"Toggle visibility of identity {ident_id} (nodes + edges + weights)"
+                if not is_hidden
+                else f"Identity {ident_id} has no detection this frame"
             )
             rl.addWidget(chk)
 
@@ -439,10 +497,6 @@ class GroupGraphWindow(QDialog):
                     except (TypeError, ValueError):
                         score_str = "—"
                     line = QLabel(f"{cam}: {score_str}")
-                    # Bigger than before (10 pt) and color inherited from the
-                    # theme palette — under a dark theme that comes out
-                    # near-white instead of the previously hard-coded #555
-                    # which read as nearly transparent.
                     line.setStyleSheet("font-size: 10pt;")
                     dl.addWidget(line)
             else:
@@ -452,13 +506,13 @@ class GroupGraphWindow(QDialog):
             cv.addWidget(detail)
 
             # Initial expand state + button glyph.
-            is_expanded = g_idx in self._expanded_groups
+            is_expanded = ident_id in self._expanded_identities
             detail.setVisible(is_expanded)
             expand_btn.setChecked(is_expanded)
             expand_btn.setText("▾" if is_expanded else "▸")
             expand_btn.toggled.connect(
-                lambda checked, gi=g_idx, d=detail, b=expand_btn:
-                    self._on_expand_toggled(gi, checked, d, b)
+                lambda checked, ii=ident_id, d=detail, b=expand_btn:
+                    self._on_expand_toggled(ii, checked, d, b)
             )
 
             self._display_body_layout.addWidget(container)
@@ -487,29 +541,35 @@ class GroupGraphWindow(QDialog):
         self._color_by_camera = True
         self._draw_current()
 
-    def _on_group_toggled(self, group_idx: int, checked: bool) -> None:
+    def _on_identity_toggled(self, ident_id: int, checked: bool) -> None:
         if checked:
-            self._visible_groups.add(group_idx)
+            self._visible_identities.add(ident_id)
         else:
-            self._visible_groups.discard(group_idx)
+            self._visible_identities.discard(ident_id)
+        # Persist a copy so navigating away and back restores the toggle
+        # state. We snapshot rather than alias so a later `_refresh` that
+        # reads the cache doesn't pick up in-progress edits.
+        self._cached_visible_identities[self._frame_idx] = set(self._visible_identities)
         self._draw_current()
 
     def _on_reset_layout(self) -> None:
         """Drop any user-dragged positions for the current frame and redraw
         with the default polygon layout."""
-        self._node_positions.pop(self._frame_idx, None)
+        self._cached_node_positions.pop(self._frame_idx, None)
         self._draw_current()
 
     def _on_expand_toggled(
-        self, group_idx: int, checked: bool, detail_panel: QWidget, btn: QToolButton
+        self, ident_id: int, checked: bool, detail_panel: QWidget, btn: QToolButton
     ) -> None:
-        """Show / hide a group's per-view score breakdown without rebuilding
+        """Show / hide an identity's per-view score breakdown without rebuilding
         the whole display panel (so other expansions, the Weights toggle,
         and visibility checkboxes keep their state)."""
         if checked:
-            self._expanded_groups.add(group_idx)
+            self._expanded_identities.add(ident_id)
         else:
-            self._expanded_groups.discard(group_idx)
+            self._expanded_identities.discard(ident_id)
+        # Persist so the expand state survives frame navigation.
+        self._cached_expanded_identities[self._frame_idx] = set(self._expanded_identities)
         detail_panel.setVisible(checked)
         btn.setText("▾" if checked else "▸")
 
@@ -523,6 +583,40 @@ class GroupGraphWindow(QDialog):
     # accidentally grabbing a neighbor when nodes are stacked closely
     # along a camera's tangent.
     _HIT_RADIUS = 0.15
+    # Tighter than the node radius — edges are 1.5 px lines, so the
+    # cursor needs to be close. Still generous enough to hit comfortably
+    # when zoomed to the default extent.
+    _EDGE_HIT_RADIUS = 0.05
+
+    def _hit_test_edge(self, event) -> Optional[frozenset]:
+        """Return the edge_key of the segment under `event`, or None.
+
+        Closest point-to-segment distance against every line drawn in
+        the last _draw pass. Edge keys are frozensets of (cam, track)
+        endpoint tuples, so they're stable regardless of which order
+        the matrix iteration visits the endpoints.
+        """
+        if event.inaxes is None or event.xdata is None or event.ydata is None:
+            return None
+        if not self._current_edges:
+            return None
+        p = np.array([float(event.xdata), float(event.ydata)])
+        best, best_d = None, float("inf")
+        for key, (a, b) in self._current_edges.items():
+            ab = b - a
+            denom = float(np.dot(ab, ab))
+            if denom <= 1e-12:
+                d = float(np.linalg.norm(p - a))
+            else:
+                t = float(np.dot(p - a, ab) / denom)
+                t = max(0.0, min(1.0, t))
+                closest = a + t * ab
+                d = float(np.linalg.norm(p - closest))
+            if d < best_d:
+                best, best_d = key, d
+        if best is not None and best_d <= self._EDGE_HIT_RADIUS:
+            return best
+        return None
 
     def _hit_test_node(self, event) -> Optional[tuple[str, int]]:
         """Return the (cam, track) of the closest node under `event`, or
@@ -545,19 +639,29 @@ class GroupGraphWindow(QDialog):
         return None
 
     def _on_mouse_press(self, event) -> None:
-        """Begin a drag if the left button presses on top of a node."""
+        """Begin a drag if the left button presses on top of a node;
+        otherwise toggle the muted state of any edge under the cursor."""
         if event.button != 1:
             return
         hit = self._hit_test_node(event)
-        if hit is None:
+        if hit is not None:
+            self._drag_node = hit
+            # Lock the grip offset so the node tracks the cursor at the
+            # click point rather than snapping its center to the cursor
+            # — feels more natural during drag.
+            grip = np.array([float(event.xdata), float(event.ydata)])
+            self._drag_offset = self._current_node_pos[hit] - grip
+            self._canvas.setCursor(Qt.ClosedHandCursor)
             return
-        self._drag_node = hit
-        # Lock the grip offset so the node tracks the cursor at the click
-        # point rather than snapping its center to the cursor — feels more
-        # natural during drag.
-        grip = np.array([float(event.xdata), float(event.ydata)])
-        self._drag_offset = self._current_node_pos[hit] - grip
-        self._canvas.setCursor(Qt.ClosedHandCursor)
+
+        edge_hit = self._hit_test_edge(event)
+        if edge_hit is not None:
+            disabled = self._cached_disabled_edges.setdefault(self._frame_idx, set())
+            if edge_hit in disabled:
+                disabled.discard(edge_hit)
+            else:
+                disabled.add(edge_hit)
+            self._draw_current()
 
     def _on_mouse_motion(self, event) -> None:
         """Either drag the active node or update the hover cursor."""
@@ -573,22 +677,25 @@ class GroupGraphWindow(QDialog):
             )
             # Persist so the position survives toggles, color-mode flips,
             # group re-pushes, and frame round-trips.
-            frame_overrides = self._node_positions.setdefault(self._frame_idx, {})
+            frame_overrides = self._cached_node_positions.setdefault(self._frame_idx, {})
             frame_overrides[self._drag_node] = new_pos.copy()
             # Local stash for the next motion event's hit-test.
             self._current_node_pos[self._drag_node] = new_pos
             self._draw_current()
             return
 
-        # Hover-cursor toggle when not dragging.
+        # Hover-cursor toggle when not dragging. Nodes win over edges so
+        # the cursor stays consistent with what a click would actually do.
         hit = self._hit_test_node(event)
         if hit == self._hovered_node:
             return
         self._hovered_node = hit
-        if hit is None:
-            self._canvas.unsetCursor()
-        else:
+        if hit is not None:
             self._canvas.setCursor(Qt.OpenHandCursor)
+        elif self._hit_test_edge(event) is not None:
+            self._canvas.setCursor(Qt.PointingHandCursor)
+        else:
+            self._canvas.unsetCursor()
 
     def _on_mouse_release(self, event) -> None:
         if self._drag_node is None or event.button != 1:
@@ -607,10 +714,27 @@ class GroupGraphWindow(QDialog):
     # Render orchestration
     # ------------------------------------------------------------------
 
+    def _ensure_caches(self) -> None:
+        """Backfill cache / working-state attributes that may be missing
+        on an autoreloaded instance whose `__init__` ran against an
+        older field layout. No-op on a fresh instance."""
+        for name in (
+            "_cached_visible_identities",
+            "_cached_expanded_identities",
+            "_cached_disabled_edges",
+            "_cached_node_positions",
+        ):
+            if not hasattr(self, name):
+                setattr(self, name, {})
+        for name in ("_visible_identities", "_expanded_identities"):
+            if not hasattr(self, name):
+                setattr(self, name, set())
+
     def _refresh(self) -> None:
         """Pull the bundle for the current frame, reset state if needed,
         rebuild the display panel, then draw.
         """
+        self._ensure_caches()
         stored = self.session.frame_tracker_groups.get(self._frame_idx)
         if not stored:
             self._show_no_data()
@@ -621,27 +745,42 @@ class GroupGraphWindow(QDialog):
             self._show_no_data()
             return
 
-        # Reset visibility + expand state on frame change OR if the group
-        # cardinality changed (eg. the user re-pushed the same frame with
-        # different tracker output).
-        if (
-            self._frame_idx != self._last_rendered_frame
-            or self._last_group_count != len(groups)
-        ):
-            self._visible_groups = set(range(len(groups)))
-            self._expanded_groups = set()
-        self._last_rendered_frame = self._frame_idx
-        self._last_group_count = len(groups)
+        trackIds = stored.get("trackIds")
+
+        # Load working state from the per-frame cache. Defaults: all
+        # currently-present identities visible, nothing expanded.
+        #
+        # The cache is keyed by stable identity_id from sft.trackIds, so
+        # an identity that disappears for a frame retains its toggle
+        # state for when it reappears — no cardinality-based wipe needed.
+        # We still intersect the cached set with the present identities
+        # so the working `_visible_identities` only contains things that
+        # actually exist this frame (avoids drawing references to gone
+        # identities).
+        present_idents = {ident_id for ident_id, _g in self._ident_pairs(groups, trackIds)}
+
+        cached_vis = self._cached_visible_identities.get(self._frame_idx)
+        if cached_vis is None:
+            self._visible_identities = set(present_idents)
+        else:
+            self._visible_identities = set(cached_vis) & present_idents
+
+        cached_exp = self._cached_expanded_identities.get(self._frame_idx)
+        self._expanded_identities = set(cached_exp) if cached_exp else set()
 
         self._no_data_label.hide()
         self._canvas.show()
         self._display_panel.show()
-        self._rebuild_display_panel(groups)
-        self._draw(groups, stored.get("adjacency_matrix"), stored.get("instance_list"))
+        self._rebuild_display_panel(groups, trackIds=trackIds)
+        self._draw(
+            groups, stored.get("adjacency_matrix"), stored.get("instance_list"),
+            trackIds=trackIds,
+        )
 
     def _draw_current(self) -> None:
         """Re-draw using the currently stored bundle without touching the
         display-panel scaffold (used by toggle handlers)."""
+        self._ensure_caches()
         stored = self.session.frame_tracker_groups.get(self._frame_idx)
         if not stored:
             self._show_no_data()
@@ -650,7 +789,10 @@ class GroupGraphWindow(QDialog):
         if not groups:
             self._show_no_data()
             return
-        self._draw(groups, stored.get("adjacency_matrix"), stored.get("instance_list"))
+        self._draw(
+            groups, stored.get("adjacency_matrix"), stored.get("instance_list"),
+            trackIds=stored.get("trackIds"),
+        )
 
     def _show_no_data(self) -> None:
         self._canvas.hide()
@@ -663,18 +805,25 @@ class GroupGraphWindow(QDialog):
     # The actual rendering
     # ------------------------------------------------------------------
 
-    def _draw(self, groups: list, adj, instance_list) -> None:
+    def _draw(self, groups: list, adj, instance_list, trackIds=None) -> None:
         fig = self._canvas.figure
         fig.clear()
         ax = fig.add_subplot(111)
         ax.set_axis_off()
 
-        # ---- map (cam, track) -> group_idx ----------------------------
+        # ---- iterate identities (the unit of truth) -------------------
+        # Each entry is (identity_id, Group | None). Hidden identities
+        # contribute no nodes/edges but still appear in the display panel.
         # >>> TRACKER attribute read: Group.cam_track is list[(cam, track)]. <<<
-        node_to_group: dict[tuple[str, int], int] = {}
-        for g_idx, g in enumerate(groups):
-            for cam, track in g.cam_track:
-                node_to_group[(cam, track)] = g_idx
+        ident_pairs = self._ident_pairs(groups, trackIds)
+        node_to_ident: dict[tuple[str, int], int] = {}
+        ident_to_group: dict[int, object] = {}
+        for ident_id, group in ident_pairs:
+            if group is None:
+                continue
+            ident_to_group[ident_id] = group
+            for cam, track in group.cam_track:
+                node_to_ident[(cam, track)] = ident_id
 
         # ---- map matrix-index -> (cam, track) -------------------------
         # instance_list[k] = (track_idx, cam_name, points_ndarray)
@@ -685,19 +834,19 @@ class GroupGraphWindow(QDialog):
                 idx_to_node[k] = (cam_name, track_idx)
 
         # ---- visibility filter ----------------------------------------
-        visible = self._visible_groups
+        visible = self._visible_identities
         node_is_visible: dict[tuple[str, int], bool] = {
-            node: (g_idx in visible)
-            for node, g_idx in node_to_group.items()
+            node: (ident_id in visible)
+            for node, ident_id in node_to_ident.items()
         }
 
         # ---- collect cameras that have at least one visible node ------
         cams: list[str] = []
         cam_seen: set[str] = set()
-        for g_idx, g in enumerate(groups):
-            if g_idx not in visible:
+        for ident_id, group in ident_pairs:
+            if group is None or ident_id not in visible:
                 continue
-            for cam, _t in g.cam_track:
+            for cam, _t in group.cam_track:
                 if cam not in cam_seen:
                     cam_seen.add(cam)
                     cams.append(cam)
@@ -750,7 +899,7 @@ class GroupGraphWindow(QDialog):
         # Override default layout with any user-dragged positions for this
         # frame. We re-assign rather than translate so successive drags
         # compose naturally. Camera-anchor labels stay at polygon vertices.
-        user_overrides = self._node_positions.get(self._frame_idx, {})
+        user_overrides = self._cached_node_positions.get(self._frame_idx, {})
         for node, override_pos in user_overrides.items():
             if node in node_pos:
                 node_pos[node] = override_pos.copy()
@@ -761,6 +910,9 @@ class GroupGraphWindow(QDialog):
         # ---- edges from adjacency_matrix -----------------------------
         # Iterate the upper triangle. Skip np.inf / NaN (no edge).
         edges_drawn = 0
+        # Reset the hit-test registry for the new draw pass.
+        self._current_edges = {}
+        disabled_edges = self._cached_disabled_edges.get(self._frame_idx, set())
         if adj is not None and instance_list is not None:
             adj_arr = np.asarray(adj)
             n = adj_arr.shape[0]
@@ -781,33 +933,51 @@ class GroupGraphWindow(QDialog):
                     p2 = node_pos.get(node_j)
                     if p1 is None or p2 is None:
                         continue
-                    g_i = node_to_group.get(node_i)
-                    g_j = node_to_group.get(node_j)
+                    ident_i = node_to_ident.get(node_i)
+                    ident_j = node_to_ident.get(node_j)
+                    edge_key = frozenset({node_i, node_j})
+                    is_muted = edge_key in disabled_edges
                     # Edge color depends on the current "Color by" mode:
-                    #   - Identity mode: tinted with the group's identity
-                    #     color (same group → tinted; cross-group → neutral,
-                    #     which BFS shouldn't produce but we render honestly).
+                    #   - Identity mode: tinted with the identity color
+                    #     (same identity → tinted; cross-identity →
+                    #     neutral, which BFS shouldn't produce but we
+                    #     render honestly).
                     #   - Camera mode: cameras don't have a natural inter-
                     #     camera "edge identity" so edges go neutral gray.
-                    if self._color_by_camera:
+                    # Muted (user-toggled-off) overrides both: light gray
+                    # at low alpha, weight label dimmed to match.
+                    if is_muted:
+                        color = "#bbbbbb"
+                        edge_alpha = 0.25
+                    elif self._color_by_camera:
                         color = "#888888"
-                    elif g_i == g_j and g_i is not None:
-                        color = _identity_color(self.session, g_i)
+                        edge_alpha = 0.7
+                    elif ident_i == ident_j and ident_i is not None:
+                        color = _identity_color(self.session, ident_i)
+                        edge_alpha = 0.7
                     else:
                         color = "#888888"
+                        edge_alpha = 0.7
                     ax.plot(
                         [p1[0], p2[0]], [p1[1], p2[1]],
-                        color=color, linewidth=1.5, alpha=0.7, zorder=1,
+                        color=color, linewidth=1.5, alpha=edge_alpha, zorder=1,
+                    )
+                    self._current_edges[edge_key] = (
+                        np.asarray(p1, dtype=float),
+                        np.asarray(p2, dtype=float),
                     )
                     if self._show_weights:
                         mx, my = (p1[0] + p2[0]) * 0.5, (p1[1] + p2[1]) * 0.5
+                        label_color = "#888888" if is_muted else "#222222"
+                        label_bg_alpha = 0.3 if is_muted else 0.85
                         ax.text(
                             mx, my, f"{float(w):.2f}",
                             ha="center", va="center", fontsize=7,
-                            color="#222222",
+                            color=label_color,
                             bbox=dict(
                                 boxstyle="round,pad=0.18",
-                                facecolor="#ffffff", edgecolor="none", alpha=0.85,
+                                facecolor="#ffffff", edgecolor="none",
+                                alpha=label_bg_alpha,
                             ),
                             zorder=3,
                         )
@@ -815,20 +985,21 @@ class GroupGraphWindow(QDialog):
 
         # ---- nodes -----------------------------------------------------
         for node, pos in node_pos.items():
-            g_idx = node_to_group.get(node)
+            ident_id = node_to_ident.get(node)
             if self._color_by_camera:
                 # Color by the node's camera (= the polygon vertex it
-                # belongs to). Group membership only affects visibility
+                # belongs to). Identity membership only affects visibility
                 # and the invalid-group red border.
                 color = _camera_color(self.session, node[0])
             else:
                 color = (
-                    _identity_color(self.session, g_idx)
-                    if g_idx is not None else "#bbbbbb"
+                    _identity_color(self.session, ident_id)
+                    if ident_id is not None else "#bbbbbb"
                 )
             edgecolor, lw = "#222222", 1.0
             # Highlight nodes that participate in an invalid group with red.
-            if g_idx is not None and not getattr(groups[g_idx], "valid", True):
+            group_obj = ident_to_group.get(ident_id) if ident_id is not None else None
+            if group_obj is not None and not getattr(group_obj, "valid", True):
                 edgecolor, lw = "#cc0000", 2.0
             ax.scatter(
                 [pos[0]], [pos[1]],

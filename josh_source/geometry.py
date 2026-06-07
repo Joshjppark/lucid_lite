@@ -161,11 +161,11 @@ def triangulate_group(group: dict, cam_map, cache, get_reprojections=False):
         for cam, P in zip(cams, Ps):
             reprojs[cam.name] = reproject_points(points3D, P)
         
-        return points3D, reprojs
+        return dehomogenize(points3D), reprojs
 
     
     # return points2D, Ps
-    return points3D
+    return dehomogenize(points3D)
 
 
 def reproject_points(X, P):

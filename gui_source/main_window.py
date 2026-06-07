@@ -14,6 +14,7 @@ from pathlib import Path
 from PySide6.QtCore import QMimeData, QPoint, QRect, Qt, Signal
 from PySide6.QtGui import (
     QAction, QColor, QDrag, QGuiApplication, QKeySequence, QPainter, QPixmap,
+    QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
@@ -381,6 +382,7 @@ class LucidLiteWindow(QMainWindow):
 
         self._build_central()
         self._add_menus()
+        self._install_view_shortcuts()
         self._size_to_screen()
 
         self.statusBar().showMessage(
@@ -867,19 +869,111 @@ class LucidLiteWindow(QMainWindow):
         self.currentFrameChanged.emit(frame_idx)
 
     def keyPressEvent(self, event) -> None:
-        step = 10 if event.modifiers() & Qt.ShiftModifier else 1
-        if event.key() == Qt.Key_Right:
-            self.set_current_frame(self._current_frame + step)
-        elif event.key() == Qt.Key_Left:
-            self.set_current_frame(self._current_frame - step)
-        elif event.key() == Qt.Key_Home:
+        # Right/Left/Space are routed through application-wide QShortcuts
+        # in _install_view_shortcuts so they fire from any window (main,
+        # 3D viewer, graph window) regardless of focus. Home/End stay
+        # main-window-bound since they only matter when the main window
+        # or its children have focus.
+        key = event.key()
+        if key == Qt.Key_Home:
             self.set_current_frame(self.session.min_frame)
-        elif event.key() == Qt.Key_End:
+        elif key == Qt.Key_End:
             self.set_current_frame(self.session.max_frame)
-        elif event.key() == Qt.Key_Space:
-            self.playback.toggle_play()
         else:
             super().keyPressEvent(event)
+
+    # ---- view-cycle shortcuts (V solo / G multi-view) -----------------
+    #
+    # Registered as QShortcut with Qt.ApplicationShortcut so they fire
+    # regardless of which child widget currently has focus — without this,
+    # clicking on a video panel routes keys to VideoPanelWidget.keyPressEvent
+    # which doesn't propagate V/G upward.
+    #
+    # V cycles forward through solo views (one camera at a time), wrapping
+    # within the snapshot of visible cameras. G always returns to multi-view
+    # (no-op if already there). The cycle membership is frozen at the moment
+    # solo mode is entered so opening/closing tabs via the view-strip
+    # mid-cycle doesn't silently change which cams V sees.
+
+    def _install_view_shortcuts(self) -> None:
+        sc_v = QShortcut(QKeySequence("V"), self)
+        sc_v.setContext(Qt.ApplicationShortcut)
+        sc_v.activated.connect(self._cycle_solo_view)
+        sc_g = QShortcut(QKeySequence("G"), self)
+        sc_g.setContext(Qt.ApplicationShortcut)
+        sc_g.activated.connect(self._exit_solo_view)
+        # Arrow keys: ALWAYS prev/next frame. Same QShortcut +
+        # Qt.ApplicationShortcut pattern as V/G — fires regardless of
+        # which child widget has focus, and goes through the same Qt
+        # signal/slot path the rest of frame navigation uses (timeline,
+        # playback) so panels decode and repaint exactly like they do
+        # for those callers.
+        sc_right = QShortcut(QKeySequence(Qt.Key_Right), self)
+        sc_right.setContext(Qt.ApplicationShortcut)
+        sc_right.activated.connect(self._step_next_frame)
+        sc_left = QShortcut(QKeySequence(Qt.Key_Left), self)
+        sc_left.setContext(Qt.ApplicationShortcut)
+        sc_left.activated.connect(self._step_prev_frame)
+        # Space toggles playback application-wide. Same pattern so the
+        # shortcut fires when the focus is on a child dialog (3D viewer,
+        # group-graph window) without needing per-dialog wiring.
+        sc_space = QShortcut(QKeySequence(Qt.Key_Space), self)
+        sc_space.setContext(Qt.ApplicationShortcut)
+        sc_space.activated.connect(self._toggle_play)
+
+    def _toggle_play(self) -> None:
+        if hasattr(self, "playback"):
+            self.playback.toggle_play()
+
+    def _step_next_frame(self) -> None:
+        self.set_current_frame(self._current_frame + 1)
+
+    def _step_prev_frame(self) -> None:
+        self.set_current_frame(self._current_frame - 1)
+
+    def _cycle_solo_view(self) -> None:
+        if getattr(self, "_solo_state", None) is None:
+            visible_cams = [
+                cam for cam, tab in self._video_tabs.items()
+                if tab.isVisible() and tab.parent() is not None
+            ]
+            if not visible_cams:
+                return
+            self._solo_state = {"cams": visible_cams, "idx": 0}
+            self._apply_solo_view(visible_cams[0])
+            self.statusBar().showMessage(
+                f"Solo view: {visible_cams[0]} (V to cycle, G to restore)"
+            )
+            return
+
+        cams = self._solo_state["cams"]
+        self._solo_state["idx"] = (self._solo_state["idx"] + 1) % len(cams)
+        cam = cams[self._solo_state["idx"]]
+        self._apply_solo_view(cam)
+        self.statusBar().showMessage(
+            f"Solo view: {cam} (V to cycle, G to restore)"
+        )
+
+    def _apply_solo_view(self, solo_cam: str) -> None:
+        """Hide every tab in the active cycle except `solo_cam`."""
+        state = getattr(self, "_solo_state", None)
+        if state is None:
+            return
+        for cam in state["cams"]:
+            tab = self._video_tabs.get(cam)
+            if tab is not None:
+                tab.setVisible(cam == solo_cam)
+
+    def _exit_solo_view(self) -> None:
+        state = getattr(self, "_solo_state", None)
+        if state is None:
+            return
+        for cam in state["cams"]:
+            tab = self._video_tabs.get(cam)
+            if tab is not None:
+                tab.setVisible(True)
+        self._solo_state = None
+        self.statusBar().showMessage("Multi-view restored")
 
     # ---- menu handlers -----------------------------------------------
 

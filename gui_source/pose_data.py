@@ -390,6 +390,7 @@ class Session(QObject):
         groups,
         adjacency_matrix=None,
         instance_list=None,
+        trackIds=None,
     ) -> None:
         """Store the tracker-derived groups for a single frame.
 
@@ -399,6 +400,13 @@ class Session(QObject):
         list of `(track_idx, cam_name, points)` tuples that maps matrix
         index → instance. Both are stored opaquely so the graph viewer
         can render edge weights without re-running the tracker.
+
+        `trackIds` is the `sft.trackIds` dict (identity_id ->
+        TrackedIdentity) at this frame, or None for an invalid frame.
+        The graph window uses it to map each Group back to the stable
+        identity_id assigned by the tracker — so node colors and
+        toggle-row labels reflect the actual identity, not the
+        positional index in `groups`.
 
         Pass `groups=None` or an empty sequence to clear the entry. The
         graph window listens on `groups_changed` to know to redraw.
@@ -410,6 +418,7 @@ class Session(QObject):
                 "instance_list": (
                     list(instance_list) if instance_list is not None else None
                 ),
+                "trackIds": trackIds,
             }
         else:
             self.frame_tracker_groups.pop(frame_idx, None)

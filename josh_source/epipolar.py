@@ -34,7 +34,7 @@ def display_cams(window, cam_names, df, SKEL, TRACK_COLOR_MAP, grid_shape=None, 
     for cam, ax in zip(cam_names, axes):
 
         # get frame video data
-        qimg = window._video_panels[cam]._decoder.get_frame(window._current_frame)
+        qimg = window._video_panels[cam].get_frame_sync(window._current_frame)
         frame = qimg_to_np(qimg)
 
         # display frame
@@ -120,7 +120,7 @@ def draw_epline_single_point(window, fg ,CAMERAS, cam_names, df, node_idx, track
         for cam, ax, instance_pts in zip(cam_names, axs, points):
             
             # get frame video data
-            qimg = window._video_panels[cam]._decoder.get_frame(fg.frame_idx)
+            qimg = window._video_panels[cam].get_frame_sync(fg.frame_idx)
             frame = qimg_to_np(qimg)
 
             # display frame
@@ -211,7 +211,7 @@ def draw_eplines_whole_instance(window, CAMERAS, cam_names, df, track_idx=0):
         for cam, ax, instance_pts in zip(cam_names, axs, points):
             
             # get frame video data
-            qimg = window._video_panels[cam]._decoder.get_frame(window._current_frame)
+            qimg = window._video_panels[cam].get_frame_sync(window._current_frame)
             frame = qimg_to_np(qimg)
 
             # display frame

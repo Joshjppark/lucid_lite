@@ -90,9 +90,9 @@ def main(argv: list[str]) -> int:
     # Always hand back (app, window). When invoked from a Jupyter notebook
     # with `%gui qt`, control returns to the caller immediately — if `window`
     # isn't kept alive by the caller it gets garbage-collected, child
-    # VideoPanelWidgets / DecodeWorkers die, and pending QThreadPool decode
-    # tasks crash with "RuntimeError: Signal source has been deleted" when
-    # they try to emit `frame_ready`.
+    # VideoPanelWidgets (and their per-camera FrameLoaderThreads) die and
+    # in-flight decodes crash on emit. Keep the window reference alive in
+    # the notebook:
     # Notebook caller:  app, window = main.main([])    # keep `window`!
     # CLI caller below runs app.exec() itself.
     return app, window

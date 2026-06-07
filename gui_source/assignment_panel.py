@@ -209,7 +209,8 @@ class IdentityAssignmentPanel(QWidget):
         self._tabs.addTab(tab, "Track/ID")
 
     def _build_groups_tab(self) -> None:
-        """Groups tab: just a button that opens the group-graph window.
+        """Groups tab: buttons that open the group-graph window and the 3D
+        triangulation viewport.
 
         Group data itself is computed and pushed by the notebook (see
         push_frame_assignments in notebooks/tracking_test.ipynb); this tab is
@@ -226,7 +227,19 @@ class IdentityAssignmentPanel(QWidget):
         )
         self.show_graph_btn.clicked.connect(self._show_group_graph)
         v.addWidget(self.show_graph_btn)
+
+        self.show_3d_btn = QPushButton("Show 3D Triangulation")
+        self.show_3d_btn.setToolTip(
+            "Open a 3D viewport showing the triangulated skeleton for the "
+            "current frame. Coloring follows the Track/ID radio above; "
+            "click+drag to orbit, middle-drag to pan, wheel to zoom."
+        )
+        self.show_3d_btn.clicked.connect(self._show_triangulation_3d)
+        v.addWidget(self.show_3d_btn)
         v.addStretch(1)
+
+        # Lazily-created 3D window — mirrors the _graph_window pattern.
+        self._triangulation_window = None  # type: ignore[assignment]
 
         self._tabs.addTab(tab, "Groups")
 
@@ -238,6 +251,14 @@ class IdentityAssignmentPanel(QWidget):
         self._refresh()
 
     # ---- refresh / populate ------------------------------------------
+
+    def _track_display_name(self, track_idx: int) -> str:
+        """Track name from session.tracks, falling back to `t{idx}` when the
+        index is unknown. Used both as the sort key in `_refresh` and for the
+        text drawn on each row."""
+        if 0 <= track_idx < len(self.session.tracks):
+            return self.session.tracks[track_idx]
+        return f"t{track_idx}"
 
     def _refresh(self) -> None:
         self._populating = True
@@ -261,9 +282,7 @@ class IdentityAssignmentPanel(QWidget):
 
                 # Unique tracks visible in this camera at the current frame,
                 # paired with their (visible, total) node counts. One pass
-                # over the camera's instances handles both — `track_to_points`
-                # preserves insertion order so `tracks_here` keeps the
-                # original ordering from `get_instances`.
+                # over the camera's instances handles both.
                 track_to_points: dict[int, tuple[int, int]] = {}
                 if fg is not None:
                     for inst in fg.get_instances(cam_name):
@@ -277,7 +296,11 @@ class IdentityAssignmentPanel(QWidget):
                             and math.isfinite(pt[1])
                         )
                         track_to_points[inst.track_idx] = (n_visible, n_total)
-                tracks_here: list[int] = list(track_to_points.keys())
+                # Sort by displayed track name so the panel reads in the same
+                # order across cameras regardless of per-cam track_idx ordering.
+                tracks_here: list[int] = sorted(
+                    track_to_points.keys(), key=self._track_display_name
+                )
 
                 if not tracks_here:
                     # Reserve visual space under empty cameras with a muted
@@ -292,11 +315,7 @@ class IdentityAssignmentPanel(QWidget):
                     continue
 
                 for track_idx in tracks_here:
-                    track_name = (
-                        self.session.tracks[track_idx]
-                        if 0 <= track_idx < len(self.session.tracks)
-                        else f"t{track_idx}"
-                    )
+                    track_name = self._track_display_name(track_idx)
                     track_item = QTreeWidgetItem(
                         [f"{track_idx} ({track_name})", "", ""]
                     )
@@ -459,6 +478,23 @@ class IdentityAssignmentPanel(QWidget):
         self._graph_window.show()
         self._graph_window.raise_()
         self._graph_window.activateWindow()
+
+    def _show_triangulation_3d(self) -> None:
+        """Open (or raise) the 3D triangulation viewport. Lazily imports
+        `triangulation_3d_window` so the pyqtgraph/OpenGL stack is only
+        loaded when the user actually opens the window."""
+        if self._triangulation_window is None:
+            from triangulation_3d_window import Triangulation3DWindow
+            # Parent is the LucidLiteWindow so `parent.currentFrameChanged`
+            # is reachable for the auto-follow connect inside the dialog.
+            self._triangulation_window = Triangulation3DWindow(
+                self.session, self._current_frame, parent=self.window()
+            )
+        else:
+            self._triangulation_window.set_frame(self._current_frame)
+        self._triangulation_window.show()
+        self._triangulation_window.raise_()
+        self._triangulation_window.activateWindow()
 
     def _sync_color_mode_ui(self, mode: str) -> None:
         self.color_mode_track_btn.blockSignals(True)

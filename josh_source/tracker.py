@@ -1,16 +1,24 @@
 
 
+import logging
 import matplotlib.pyplot as plt
 import numpy as np
+from tqdm import tqdm
 
 from collections import defaultdict
 from dataclasses import dataclass
+from typing import Optional, Union
+
 
 from scipy.optimize import linear_sum_assignment
 from PySide6.QtGui import QImage
 
 from .geometry import *
 from gui_source.pose_data import Camera, FrameGroup, Instance
+
+
+logging.basicConfig(level=logging.INFO)
+
 
 def qimg_to_np(qimg: QImage):
     img = qimg.convertToFormat(QImage.Format_RGB888)
@@ -71,53 +79,32 @@ class ProjCache:
 
 class Group:
 
-    def __init__(self, group, instance_list, id_, cam_map, proj_cache):
+    # def __init__(self, group, instance_list, id_, cam_map, proj_cache):
+    def __init__(self, group, instance_list, cam_map, proj_cache):
 
-        # default to a correct group with max 1 instance per cam
-        self.valid = True
-
+        self.id = None
+        self.valid, self.cams_by_count, self.points_by_cam, self.cam_track = self.is_valid(
+            group=group,
+            instance_list=instance_list,
+            return_dict=True
+        )
         
-        self.cams_by_count = defaultdict(int)
-        
-        points_by_cam = {}
-        cam_track: list[tuple[str, int]] = []
-        for instance_idx in group:
-            track_idx, cam, pts = instance_list[instance_idx]
-
-
-            # store cam information
-            self.cams_by_count[cam] += 1
-            cam_track.append((cam, track_idx))
-
-            # add points to dictionary
-            if cam in points_by_cam:
-                points_by_cam[cam].append(pts)
-                self.valid = False # multiple instances in the same view
-            else:
-                points_by_cam[cam] = [pts]
-
-
-        self.points_by_cam = points_by_cam
-        self.cam_track = cam_track
-        self.id = id_
-
         if self.valid:
-            points_3d, reproj_score = self.triangulate(cam_map, proj_cache)
-            self.points_3d = points_3d
+            points3d, reproj_score = self.triangulate(cam_map, proj_cache)
+            self.points3d = points3d
             self.reproj_score = reproj_score
         else:
-            self.points_3d = None
+            self.points3d = None
             self.reproj_scores = {}
-
 
 
     def triangulate(self, cam_map, cache):
         group = {cam: self.points_by_cam[cam][0] for cam in self.points_by_cam}
-        points_3d, reprojs = triangulate_group(group, cam_map, cache, get_reprojections=True)
-        # print(f'points_3D for group {self.id} {points_3d}')
+        points3d, reprojs = triangulate_group(group, cam_map, cache, get_reprojections=True)
+        # print(f'points3d for group {self.id} {points3d}')
         reproj_scores = self._calc_reprojs(reprojs)
 
-        return points_3d, reproj_scores
+        return points3d, reproj_scores
 
 
     def _calc_reprojs(self, reprojs) -> dict[str, float]:
@@ -130,6 +117,55 @@ class Group:
         return reproj_score
     
 
+    @staticmethod
+    def is_valid(group, instance_list, return_dict=False) -> Union[bool, Optional[dict]]:
+        '''
+        checks validity of group
+        '''
+
+        cams_by_count = defaultdict(int)
+        cam_track = []
+        points_by_cam = {}
+        isvalid = True
+        for instance_idx in group:
+            track_idx, cam, pts = instance_list[instance_idx]
+
+            # store cam information
+            cams_by_count[cam] += 1
+            cam_track.append((cam, track_idx)) 
+
+            # add points to dictionary
+            if cam in points_by_cam:
+                points_by_cam[cam].append(pts)
+                isvalid = False # multiple instances in the same view
+            else:
+                points_by_cam[cam] = [pts]
+
+        if return_dict:
+            return isvalid, cams_by_count, points_by_cam, cam_track
+        else:
+            return isvalid
+
+        
+    
+@dataclass
+class TrackedIdentity:
+    id: int
+    group: Optional[Group] = None               # current frame's detection, None if occluded
+    frames_hidden: int = 0                      # consecutive frames with no detection
+    last_points3d: Optional[np.ndarray] = None
+
+    def __post_init__(self):
+        
+        if self.group is not None:
+            self.group.id = self.id
+
+    @property
+    def visible(self) -> bool:
+        return self.group is not None and self.group.valid
+
+
+
 class SingleFrameTrack:
 
     def __init__(
@@ -137,7 +173,9 @@ class SingleFrameTrack:
             fg: FrameGroup,
             cameras: Camera,
             proj_cache: ProjCache,
-            node_weights: np.ndarray
+            node_weights: np.ndarray,
+            prev_trackIds: dict[int, TrackedIdentity] = None,
+            max_ids: int = None,
         ) -> None:
         '''
         Params:
@@ -150,6 +188,8 @@ class SingleFrameTrack:
         self.frame_idx = fg.frame_idx
         self.proj_cache = proj_cache
         self.node_weights = np.array(list(node_weights.values()))
+        self.prev_trackIds = prev_trackIds
+        self.max_ids = max_ids
 
 
         # attributes to be updated a future time
@@ -157,8 +197,12 @@ class SingleFrameTrack:
         self.adjacency_matrix = None
         self.edges = None
         self.groups = None
-        self.bad_instances = []
-        self.match_conflicts = []
+        self.trackIds = None
+        self.visible_ids = []
+        self.invalid_instances = []
+        self.nonmatch_instances = []
+        self.nonmatch_groups = []
+        self.match_conflicts: dict[tuple(str, str): tuple(int, int)] = []
 
 
         self.cam_count_dict: dict[str, int] = {cam: len(insts) for cam, insts in fg.instances.items()}
@@ -166,7 +210,7 @@ class SingleFrameTrack:
         self.cam_map = {c.name: c for c in self.cameras}
 
         # hyper parameters
-        self.EPIPOLE_THRESHOLD = 10
+        self.EPIPOLE_THRESHOLD = 9
         self.MIN_NODES = 3
 
 
@@ -208,7 +252,7 @@ class SingleFrameTrack:
                 num_valid_nodes = np.sum(~np.isnan(pts).any(axis=1))
 
                 if num_valid_nodes < self.MIN_NODES:
-                    self.bad_instances.append((inst.track_idx, cam_name, pts))
+                    self.invalid_instances.append((inst.track_idx, cam_name, pts))
                     continue
 
                 instance_list.append((inst.track_idx, cam_name, pts))
@@ -225,30 +269,45 @@ class SingleFrameTrack:
                                
         self.adjacency_matrix = np.full((self.n_insts, self.n_insts), np.inf)
         self.edges = self._calc_edge_weights()
-        self.groups = self._run_bfs()
+        # self.groups = self._run_bfs()
+        self.groups = self._run_union_find()
+
+        if self.prev_trackIds is None:
+            # initial frame - assign identities to groups
+            self.trackIds = self._init_identities() 
+        else:
+            # subsequent frames - assign identites to match prev frame
+
+            # TEMP SOLN
+            if not all([g.valid for g in self.groups]):
+                self.trackIds = None
+                return
+
+
+            self.trackIds = self._match_prev_groups()
 
 
     def smart_hungarian(self, edges):
-        mask = edges < self.EPIPOLE_THRESHOLD
-        row_counts = mask.sum(axis=1)
-        col_counts = mask.sum(axis=0)
+        valid = edges < self.EPIPOLE_THRESHOLD
+        row_sum = valid.sum(axis=1)
+        col_sum = valid.sum(axis=0)
 
-        match_conflicts = []
+        safe_mask = valid & (row_sum[:, None] == 1) & (col_sum[None, :] == 1) 
+        matches = list(zip(*np.where(safe_mask)))
 
-        # row collision
-        for r in np.where(row_counts > 1)[0]:
-            c_indices = np.where(mask[r, :])[0]
-            match_conflicts.append(np.column_stack((np.full(len(c_indices), r), c_indices)))
+        # look for duplicates along the columns
+        conflicts = []
+        for c in np.where(col_sum > 1)[0]:
+            row_dups = np.where(valid[:, c])[0]
+            conflicts += [(int(r), int(c)) for r in row_dups]
 
-        # columns collisions
-        for c in np.where(col_counts > 1)[0]:
-            r_indices = np.where(mask[:, c])[0]
-            match_conflicts.append(np.column_stack((r_indices, np.full(len(r_indices), c))))
 
-        matches = mask & (row_counts == 1) & (col_counts == 1)
-        matches = np.column_stack(np.where(matches))
+        # look for duplicates along the rows
+        for r in np.where(row_sum > 1)[0]:
+            col_dups = np.where(valid[r, :])[0]
+            conflicts += [(int(r), int(c)) for c in col_dups]
 
-        return matches, match_conflicts
+        return matches, conflicts
 
 
     def _calc_edge_weights(self):
@@ -269,31 +328,24 @@ class SingleFrameTrack:
             # run hungarian
             # rows, cols = linear_sum_assignment(edges)
 
-
             # run 'smart' hungarian
-            matches, match_conflicts = self.smart_hungarian(edges)
-            self.match_conflicts.append(match_conflicts)
+            matches, conflicts = self.smart_hungarian(edges)
+            # print(conflicts, (cam1, cam2))
+            for conflict in conflicts:
 
-
-            # print(f'calculated edges with cams {cam1}, {cam2}')
+                # print((inst1_idx, inst2_idx))
+                r, c = conflict
+                inst1_idx = self.instance_by_cam[cam1][r][0]
+                inst2_idx = self.instance_by_cam[cam2][orig_col_idx[c]][0]
+                self.match_conflicts.append((inst1_idx, inst2_idx))
 
             # add row and column assignments from edge hungarian to the adjacency matrix
-            for r, c in zip(rows, cols):
-                
-
+            for (r, c) in matches:
                 inst1_idx = self.instance_by_cam[cam1][r][0]
                 inst2_idx = self.instance_by_cam[cam2][orig_col_idx[c]][0]
 
-                try:
-                    self.adjacency_matrix[inst1_idx, inst2_idx] = edges[r, c]
-                    self.adjacency_matrix[inst2_idx, inst1_idx] = edges[r, c]
-                except:
-                    print(f'c is {c}')
-                    print(self._calc_edge(self.cam_map[cam1], self.cam_map[cam2]))
-                    print(orig_col_idx)
-                    print(edges)
-
-                    raise AssertionError
+                self.adjacency_matrix[inst1_idx, inst2_idx] = edges[r, c]
+                self.adjacency_matrix[inst2_idx, inst1_idx] = edges[r, c]
 
         return edge_dict
 
@@ -303,7 +355,6 @@ class SingleFrameTrack:
         
         cam1_points = self.instance_by_cam[cam1.name]
         cam2_points = self.instance_by_cam[cam2.name]
-
 
         edges = np.zeros((len(cam1_points), len(cam2_points)), dtype=np.float64)
         
@@ -317,7 +368,6 @@ class SingleFrameTrack:
         return edges
 
 
-
     def _run_bfs(self):
         
         visited = np.zeros(self.n_insts, dtype=bool)
@@ -326,12 +376,12 @@ class SingleFrameTrack:
         while not np.all(visited):
 
             unvisited = np.where(~visited)[0][0]
-            # unvisited = np.where(visited == np.False_)[0][0]
             explored = [unvisited]
             visited[unvisited] = True
             
             group = []
 
+            # run bfs on subgraphs
             while explored:
                 vertex = explored.pop(0)
                 group.append(int(vertex))
@@ -342,10 +392,277 @@ class SingleFrameTrack:
                         visited[neighbor] = True
                         explored.append(neighbor)
 
+            if len(group) < 2:
+                for v in group: self.nonmatch_instances.extend(self.instance_list[v])
+                continue
+
+            # valid = Group.is_valid(group=group, instance_list=self.instance_list)
+
+            # if valid or :
             groups.append(Group(group, self.instance_list, len(groups), self.cam_map, self.proj_cache))
-            # groups.append(group)
+            
+
+
         return groups
 
+
+    def _run_union_find(self):
+
+            n_nodes = self.adjacency_matrix.shape[0]
+            parent = {n: n for n in range(n_nodes)}
+            cam_to_id = {c.name: i for i, c in enumerate(self.cameras)}
+            camera_ids = [cam_to_id[tup[1]] for tup in self.instance_list]
+
+            cameras_in_component = {n: {camera_ids[n]} for n in range(n_nodes)}
+
+
+            def find(i):
+                if parent[i] == i: return i
+                parent[i] = find(parent[i])
+                return parent[i]
+
+            def union(i, j):
+                root_i = find(i)
+                root_j = find(j)
+                if root_i != root_j:
+                    parent[root_i] = root_j
+                    cameras_in_component[root_j].update(cameras_in_component[root_i])
+
+            # TODO: put in the 'good' bad_edges back into the graph
+            edge_conflicts = {frozenset(edge) for edge in self.match_conflicts}
+
+            for i in range(n_nodes):
+                for j in range(n_nodes):
+                    if self.adjacency_matrix[i][j] != np.inf and frozenset({i, j}) not in edge_conflicts:
+                        union(i, j)
+
+            # add in valid edges back in
+            for u, v in edge_conflicts:
+                root_u = find(u)
+                root_v = find(v)
+
+                if root_u == root_v:
+                    continue
+
+                if cameras_in_component[root_u].isdisjoint(cameras_in_component[root_v]):
+                    # merge the two if valid subgraph
+                    parent[root_u] = root_v
+                    cameras_in_component[root_v].update(cameras_in_component[root_u])
+
+
+            # find all groups
+            distinct_groups = defaultdict(list)
+            for node in range(n_nodes):
+                root = find(node)
+                distinct_groups[root].append(node)
+
+
+            # check validity of groups
+            groups = []
+            for group in list(distinct_groups.values()):
+                if len(group) < 2:
+                    for v in group: self.nonmatch_instances.extend(self.instance_list[v])    
+                elif Group.is_valid(group, self.instance_list):
+                    groups.append(Group(group, self.instance_list, self.cam_map, self.proj_cache))
+                else:
+                    # group itself is 
+                    fixed_groups = self._fix_group(group)
+                    for fixed_group in fixed_groups:
+                        if len(fixed_group) < 2:
+                            for v in group: self.nonmatch_instances.extend(self.instance_list[v])
+                        else:
+                            groups.append(Group(fixed_group, self.instance_list, self.cam_map, self.proj_cache))
+
+
+
+            return groups
+
+
+    def _fix_group(self, group):
+    
+        parent = {n: n for n in group}
+        cam_to_id = {cam.name: i for i, cam in enumerate(self.cameras)}
+        camera_ids = [cam_to_id[t[1]]for t in self.instance_list]
+        cameras_in_component = {n: {camera_ids[n]} for n in group}
+
+        def find(i):
+            if parent[i] == i: return i
+            parent[i] =  find(parent[i])
+            return parent[i]
+
+        # extract all the possible edges
+        edges = []
+        n_nodes = len(group)
+        for i in range(n_nodes):
+            for j in range(i+1, n_nodes):
+                u, v = group[i], group[j]
+                weight = self.adjacency_matrix[u, v]
+                if weight != np.inf:
+                    edges.append((u, v, weight))
+
+        edges.sort(key=lambda x: x[2])
+
+
+        for u, v, _ in edges:
+            root_u = find(u)
+            root_v = find(v)
+
+            # same parent --> do nothing; nodes already in same group
+            if root_u == root_v:
+                continue
+
+            if cameras_in_component[root_v].isdisjoint(cameras_in_component[root_u]):
+                # disjoint cameras --> valid to joint nodes
+                parent[root_v] = root_u
+                cameras_in_component[root_u].update(cameras_in_component[root_v])
+            else:
+                # non disjoint camera sets --> do not join nodes
+                # don't connect the groups
+                continue
+
+        distinct_groups = defaultdict(list)
+        for node in group:
+            root = find(node)
+            distinct_groups[root].append(node)
+        
+        return list(distinct_groups.values())
+
+
+    def _init_identities(self):
+        
+        if not self.max_ids:
+            self.max_ids = max(self.cam_count_dict.values())
+
+        trackIds = {}
+        # assign identities with visible tracks
+        for i, group in enumerate(self.groups):
+            trackIds[i] = TrackedIdentity(
+                id = i,
+                group = group,
+                last_points3d=group.points3d,
+            )
+            self.visible_ids.append(i)
+
+        # assign leftover identities to reach max_ids
+        for i in range(len(self.groups), self.max_ids):
+            trackIds[i] = TrackedIdentity(
+                id = i,
+                group = None,
+            )
+
+        return trackIds
+
+
+    def _match_prev_groups(self):
+
+        '''
+        Matches current group assignment to prev frame groups
+        so that identities can be consist across consecutive frames
+        '''
+
+        curr_groups_num = len(self.groups)
+        prev_groups_num = len(self.prev_trackIds)
+
+        matchable_ids =  [i for i, p in self.prev_trackIds.items() if p.last_points3d is not None]
+
+        # populate the cost matrix
+        costs = np.full((curr_groups_num, len(matchable_ids)), np.inf)
+        for col, id_ in enumerate(matchable_ids):
+            for row in range(curr_groups_num):
+                
+                # print(self.groups[row].points3d)
+                assert self.groups[row].points3d is not None
+                last = self.prev_trackIds[id_].last_points3d
+
+                costs[row, col] = np.nanmean(
+                    np.linalg.norm(
+                        self.groups[row].points3d-last,
+                        axis=1,
+                    )
+                )
+
+        # first: assign best matches - matches that are minumum along cost row and columns
+        row_mins = np.argmin(costs, axis=1)
+        col_mins = np.argmin(costs, axis=0)
+        best_match_rows = np.where(col_mins[row_mins] == np.arange(costs.shape[0]))[0]
+        best_match_cols = row_mins[best_match_rows]
+
+        mutual_matches = np.column_stack((best_match_rows, best_match_cols))
+
+        # second: assign remaining 'non' mutual matches with hungarian
+        remaining_r = np.setdiff1d(np.arange(costs.shape[0]), best_match_rows)
+        remaining_c = np.setdiff1d(np.arange(costs.shape[1]), best_match_cols)
+        submatrix = costs[np.ix_(remaining_r, remaining_c)]
+
+        local_r, local_c = linear_sum_assignment(submatrix)
+        global_r = remaining_r[local_r]
+        global_c = remaining_c[local_c]
+        hungarian_matches = np.column_stack((global_r, global_c))
+
+        final_matches = np.vstack((mutual_matches, hungarian_matches))
+    
+        # assert number of matches is number of groups in curr frame
+        if len(np.unique(final_matches[:, 0])) != curr_groups_num:
+            print(f'{self.frame_idx} has {len(np.unique(final_matches[:, 0]))} matches with {len(self.groups)} groups ')
+        # assert len(np.unique(final_matches[:, 0])) == curr_groups_num
+
+        # initialize and poopulate trackIds dict
+        trackIds = {}
+
+        # assign matches to tracks that exist in prev frame
+        for (row, col) in final_matches:
+            id_ = int(col)
+            trackIds[id_] = TrackedIdentity(
+                id = id_,
+                group = self.groups[row],
+                last_points3d = self.groups[row].points3d,
+            )
+            # self.groups[row].id = id_
+            self.visible_ids.append(id_)
+
+
+        # assign matches to id's with uninitialized points
+        open_ids = [i for i, p in self.prev_trackIds.items() if p.last_points3d is None]
+        for row in (r for r in range(curr_groups_num) if r not in final_matches[:, 0]):
+            if not open_ids:
+                # all ids are used up, remaining groups are not matched
+                self.nonmatch_groups.append(self.groups[row])
+                continue
+            id_ = open_ids.pop(0)
+
+
+            assert id_ not in trackIds
+
+            trackIds[id_] = TrackedIdentity(
+                id = id_,
+                group = self.groups[row],
+                last_points3d = self.groups[row].points3d,
+            )
+            self.groups[row].id = id_
+            self.visible_ids.append(id_)
+
+        # Propagate id's that are hidden
+        for id_, prev_track in self.prev_trackIds.items():
+            if id_ not in trackIds:
+                trackIds[id_] = TrackedIdentity(
+                    id = id_,
+                    group = None,
+                    last_points3d = prev_track.last_points3d,
+                    frames_hidden = prev_track.frames_hidden + 1,
+                )
+                # self.groups[row].id = id_
+
+        # save groups that were not assigned to an ID
+        for group in self.groups:
+            if group.id is None:
+                print(f'{self.frame_idx} Group {group} not assigned ')
+
+
+        # debugging
+        self._costs = costs
+        self._final_matches = final_matches
+
+        return trackIds
 
 
     def get_edges(self, cam1_name, cam2_name):
@@ -405,7 +722,7 @@ class SingleFrameTrack:
         for cam, ax, pts in zip([cam1_name, cam2_name], axes, points):
             
             # get frame video data
-            qimg = window._video_panels[cam]._decoder.get_frame(self.fg.frame_idx)
+            qimg = window._video_panels[cam].get_frame_sync(self.fg.frame_idx)
             frame = qimg_to_np(qimg)
 
             height, width = frame.shape[:2]
@@ -451,6 +768,7 @@ class SingleFrameTrack:
         return errors
 
 
+
     @property
     def camera_pairs(self):
         if self._camera_pairs: return self._camera_pairs
@@ -473,29 +791,70 @@ class SingleFrameTrack:
 
     
     def __repr__(self):
-        return f'{self.cam_count_dict}'
+        return f'frame: {self.frame_idx}; {self.cam_count_dict}'
         
 
 
+class MultiFrameTrack:
+
+    def __init__(
+        self,
+        window,
+        start=0,
+        end=None,
+        node_weights=None,
+        max_ids = None,
+    ):
+        self.window = window
+        self.session = window.session
+        self.proj_cache = ProjCache()
+        self.start = start
+        self.end = end if end else window.session.max_frame
+        self.max_ids = max_ids
+
+        if node_weights is None:
+            self.node_weights = {node: 1 for node in self.session.skeleton.nodes}
+        else:
+            self.node_weights = node_weights
+
+        # attributes to be updated later
+        self.frames = []
+        self.trackIds = []
+        self.invalid_instances = []
+        self.nonmatch_instances = []
+        self.visible_ids = []
 
 
-def track_frame(framegroup):
+    def track(self):
 
-    pass
+        prev_trackIds = None
+        if not self.max_ids:
+            max_ = 0
+            for i in range(self.session.max_frame):
+                lst = list(self.session.frame_group(i).instances.values())
+                num = max((len(sublist) for sublist in lst), default=0)
+                max_ = max(max_, num)
+            self.max_ids = max_
+
+        for frame_idx in tqdm(range(self.start, self.end)):
+            fg = self.session.frame_group(frame_idx)
+
+            sft = SingleFrameTrack(
+                fg, self.session.cameras,
+                node_weights=self.node_weights, proj_cache=self.proj_cache,
+                prev_trackIds=prev_trackIds, max_ids=self.max_ids,
+            )
+            prev_trackIds = sft.trackIds
+            self.frames.append(sft)
 
 
-def track_all(session):
-    '''
-    tracks all the frames.
-    
-    nowhere near done completion
-    '''
+            # update attributes
+            self.trackIds.append(sft.trackIds)
+            self.visible_ids.append(tuple(sft.visible_ids))
+            self.invalid_instances.extend(sft.invalid_instances)
+            self.nonmatch_instances.extend(sft.nonmatch_instances)
+            
 
-    for frame in (session.frame_indices):
-        fg = session.frame_group(frame)
-        track_frame(fg)
-
-        raise NotImplementedError
     
 
 
