@@ -17,7 +17,7 @@ from pathlib import Path
 from analysis_h5_reader import is_analysis_h5, merge_analysis_h5_into_session
 from calibration import find_calibration, parse_calibration_json, parse_calibration_toml
 from pose_data import InstanceGroup, Session
-from slp_reader import merge_slp_into_session
+from slp_reader import merge_project_slp_into_session, merge_slp_into_session
 
 
 def load_session_from_folder(folder: Path) -> Session:
@@ -63,20 +63,37 @@ def load_session_from_folder(folder: Path) -> Session:
             for name, _ in resolved
         ]
 
-    # Per-camera SLP / analysis-h5 + video discovery + parse.
-    # Preference order: .slp (full editable labels) -> .analysis.h5 (predictions
-    # only, but matches the LUCID multi-cam proofread export). If both exist in
-    # one subfolder we use the .slp and skip the h5, mirroring slp-import-worker.
+    # Video paths (mp4/avi) per camera — needed regardless of label source.
     for cam_name, sub in resolved:
-        slp = _first_with_suffix(sub, ".slp")
-        h5 = _first_analysis_h5(sub)
         video = _first_with_suffix(sub, ".mp4") or _first_with_suffix(sub, ".avi")
         if video is not None:
             session.video_paths[cam_name] = video
-        if slp is not None:
-            merge_slp_into_session(session, slp, cam_name)
-        elif h5 is not None:
-            merge_analysis_h5_into_session(session, h5, cam_name)
+
+    # Label source preference (matches the JS LUCID web app):
+    #
+    #   1. Root-level `project.slp` (or any *.slp directly under `folder`) —
+    #      the canonical multi-video SLEAP project file. This is what the JS
+    #      app loads, and it covers ALL calibrated cameras in one shot,
+    #      including ones that don't have their own per-cam .analysis.h5
+    #      (eg. `side/` and `sideL/` in test fixtures).
+    #   2. Per-camera `.slp` inside each `<cam>/` subfolder.
+    #   3. Per-camera `.analysis.h5` fallback (proofread predictions).
+    #
+    # Earlier versions skipped step 1 and silently dropped cameras with no
+    # per-cam label file — which caused the tracker to run on fewer
+    # cross-view constraints than the JS app and produce 2× more transient
+    # identities (lucid-lite#track-frames-discrepancy).
+    root_slp = _first_with_suffix(folder, ".slp")
+    if root_slp is not None:
+        merge_project_slp_into_session(session, root_slp, cam_key_fn=_cam_key)
+    else:
+        for cam_name, sub in resolved:
+            slp = _first_with_suffix(sub, ".slp")
+            h5 = _first_analysis_h5(sub)
+            if slp is not None:
+                merge_slp_into_session(session, slp, cam_name)
+            elif h5 is not None:
+                merge_analysis_h5_into_session(session, h5, cam_name)
 
     # Build InstanceGroups (mirrors slp-merge.js:151–180)
     rebuild_instance_groups(session)

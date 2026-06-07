@@ -5,11 +5,14 @@ Mirrors the feature scope described in prompts/plans/lucid-lite.md §5.
 """
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QButtonGroup, QComboBox, QDialog, QHBoxLayout, QLabel, QPushButton,
-    QRadioButton, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
+    QButtonGroup, QCheckBox, QComboBox, QDialog, QFrame, QHBoxLayout,
+    QHeaderView, QLabel, QPushButton, QRadioButton, QSlider, QTableWidget,
+    QTableWidgetItem, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
     QWidget,
 )
 
@@ -28,6 +31,8 @@ class IdentityAssignmentPanel(QWidget):
         self.session = session
         self._current_frame: int = session.min_frame
         self._populating: bool = False
+        # Lazily-created non-modal window opened from the Groups tab.
+        self._graph_window = None  # type: ignore[assignment]
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -37,6 +42,7 @@ class IdentityAssignmentPanel(QWidget):
 
         self._build_assignments_tab()
         self._build_track_id_tab()
+        self._build_groups_tab()
 
         # Assignments-tab refresh: all four model signals feed _refresh.
         session.identity_map_changed.connect(self._refresh)
@@ -66,11 +72,24 @@ class IdentityAssignmentPanel(QWidget):
         self.frame_label.setStyleSheet("font-weight: bold;")
         v.addWidget(self.frame_label)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Camera", "Track", "Identity", "Scope"])
-        self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        v.addWidget(self.table)
+        # Tree layout: camera names are top-level nodes (bold), tracks at
+        # that frame are indented children. Column 0 holds the camera name
+        # at the top level and "track_idx (track_name)" at the leaf level.
+        # Identity combo lives in column 1; column 2 ("Points") shows how
+        # many of the skeleton's nodes are visible for that track's instance
+        # at this frame.
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(3)
+        self.tree.setHeaderLabels(["Camera / Track", "Identity", "Points"])
+        self.tree.setRootIsDecorated(True)
+        self.tree.setIndentation(16)
+        self.tree.setUniformRowHeights(True)
+        header = self.tree.header()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setStretchLastSection(False)
+        v.addWidget(self.tree)
 
         self._tabs.addTab(tab, "Assignments")
 
@@ -88,6 +107,16 @@ class IdentityAssignmentPanel(QWidget):
         btn_row.addStretch()
         v.addLayout(btn_row)
 
+        track_row = QHBoxLayout()
+        self.track_frames_btn = QPushButton("Track Frames")
+        self.track_frames_btn.setToolTip(
+            "Run luc3d identity assignment on every frame of this session."
+        )
+        self.track_frames_btn.clicked.connect(self._track_frames)
+        track_row.addWidget(self.track_frames_btn)
+        track_row.addStretch()
+        v.addLayout(track_row)
+
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Color by:"))
         self.color_mode_track_btn = QRadioButton("Track")
@@ -102,6 +131,64 @@ class IdentityAssignmentPanel(QWidget):
         mode_row.addWidget(self.color_mode_id_btn)
         mode_row.addStretch()
         v.addLayout(mode_row)
+
+        # Identity-name label visibility. Off → overlays still draw skeleton
+        # edges + nodes + node markers but no text. Drives
+        # Session.show_identity_labels via set_show_identity_labels, which
+        # emits appearance_changed → every video panel repaints.
+        labels_row = QHBoxLayout()
+        labels_row.addWidget(QLabel("Labels:"))
+        self.show_id_labels_chk = QCheckBox("Show identity names")
+        self.show_id_labels_chk.setChecked(bool(self.session.show_identity_labels))
+        self.show_id_labels_chk.setToolTip(
+            "Show or hide the identity-name text drawn next to each instance "
+            "in the video overlay."
+        )
+        self.show_id_labels_chk.toggled.connect(self._on_show_id_labels_toggled)
+        labels_row.addWidget(self.show_id_labels_chk)
+        labels_row.addStretch()
+        v.addLayout(labels_row)
+
+        # ---- skeleton appearance sliders (node radius + edge width) -----
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        v.addWidget(sep)
+
+        v.addWidget(QLabel("Skeleton appearance"))
+
+        node_row = QHBoxLayout()
+        node_row.addWidget(QLabel("Node size"))
+        self.node_size_slider = QSlider(Qt.Horizontal)
+        # Slider int range 1..40 maps to node radius 0.5..20.0 px (step 0.5).
+        self.node_size_slider.setRange(1, 40)
+        self.node_size_slider.setValue(int(round(self.session.node_size * 2)))
+        self.node_size_slider.setToolTip("Skeleton node circle radius (video px)")
+        self.node_size_value = QLabel(f"{self.session.node_size:.1f}")
+        self.node_size_value.setMinimumWidth(32)
+        self.node_size_slider.valueChanged.connect(self._on_node_size_changed)
+        node_row.addWidget(self.node_size_slider, stretch=1)
+        node_row.addWidget(self.node_size_value)
+        v.addLayout(node_row)
+
+        edge_row = QHBoxLayout()
+        edge_row.addWidget(QLabel("Edge width"))
+        self.edge_width_slider = QSlider(Qt.Horizontal)
+        # Slider int range 1..40 maps to edge width 0.5..20.0 px (step 0.5).
+        self.edge_width_slider.setRange(1, 40)
+        self.edge_width_slider.setValue(int(round(self.session.edge_width * 2)))
+        self.edge_width_slider.setToolTip("Skeleton edge stroke width (video px)")
+        self.edge_width_value = QLabel(f"{self.session.edge_width:.1f}")
+        self.edge_width_value.setMinimumWidth(32)
+        self.edge_width_slider.valueChanged.connect(self._on_edge_width_changed)
+        edge_row.addWidget(self.edge_width_slider, stretch=1)
+        edge_row.addWidget(self.edge_width_value)
+        v.addLayout(edge_row)
+
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.HLine)
+        sep2.setFrameShadow(QFrame.Sunken)
+        v.addWidget(sep2)
 
         v.addWidget(QLabel("Tracks"))
         self.tracks_table = QTableWidget(0, 2)
@@ -121,6 +208,41 @@ class IdentityAssignmentPanel(QWidget):
 
         self._tabs.addTab(tab, "Track/ID")
 
+    def _build_groups_tab(self) -> None:
+        """Groups tab: buttons that open the group-graph window and the 3D
+        triangulation viewport.
+
+        Group data itself is computed and pushed by the notebook (see
+        push_frame_assignments in notebooks/tracking_test.ipynb); this tab is
+        the GUI entry-point for *viewing* what was pushed.
+        """
+        tab = QWidget()
+        v = QVBoxLayout(tab)
+
+        self.show_graph_btn = QPushButton("Show Group Assignment Graphs")
+        self.show_graph_btn.setToolTip(
+            "Open a window showing the k-partite group graph for the current "
+            "frame (or any frame entered in the window's frame field). "
+            "Populated by push_frame_assignments in the notebook."
+        )
+        self.show_graph_btn.clicked.connect(self._show_group_graph)
+        v.addWidget(self.show_graph_btn)
+
+        self.show_3d_btn = QPushButton("Show 3D Triangulation")
+        self.show_3d_btn.setToolTip(
+            "Open a 3D viewport showing the triangulated skeleton for the "
+            "current frame. Coloring follows the Track/ID radio above; "
+            "click+drag to orbit, middle-drag to pan, wheel to zoom."
+        )
+        self.show_3d_btn.clicked.connect(self._show_triangulation_3d)
+        v.addWidget(self.show_3d_btn)
+        v.addStretch(1)
+
+        # Lazily-created 3D window — mirrors the _graph_window pattern.
+        self._triangulation_window = None  # type: ignore[assignment]
+
+        self._tabs.addTab(tab, "Groups")
+
     # ---- external API -------------------------------------------------
 
     def set_current_frame(self, frame_idx: int) -> None:
@@ -130,54 +252,105 @@ class IdentityAssignmentPanel(QWidget):
 
     # ---- refresh / populate ------------------------------------------
 
+    def _track_display_name(self, track_idx: int) -> str:
+        """Track name from session.tracks, falling back to `t{idx}` when the
+        index is unknown. Used both as the sort key in `_refresh` and for the
+        text drawn on each row."""
+        if 0 <= track_idx < len(self.session.tracks):
+            return self.session.tracks[track_idx]
+        return f"t{track_idx}"
+
     def _refresh(self) -> None:
         self._populating = True
         try:
             fg = self.session.frame_group(self._current_frame)
-            rows: list[tuple[str, int]] = []
-            if fg is not None:
-                for cam_name in sorted(fg.instances.keys()):
-                    seen_tracks: set[int] = set()
-                    for inst in fg.instances[cam_name]:
-                        if inst.track_idx is None or inst.track_idx in seen_tracks:
+            # Show every known camera once, even if no instances at this
+            # frame. Order follows session.camera_names() (loader order) so
+            # the panel matches the video grid layout.
+            cam_names = self.session.camera_names()
+            self.tree.clear()
+
+            for cam_name in cam_names:
+                cam_item = QTreeWidgetItem([cam_name, "", ""])
+                cam_font = cam_item.font(0)
+                cam_font.setBold(True)
+                cam_item.setFont(0, cam_font)
+                # Camera rows are headers — not selectable, not editable.
+                cam_item.setFlags(cam_item.flags() & ~Qt.ItemIsSelectable)
+                self.tree.addTopLevelItem(cam_item)
+                cam_item.setExpanded(True)
+
+                # Unique tracks visible in this camera at the current frame,
+                # paired with their (visible, total) node counts. One pass
+                # over the camera's instances handles both.
+                track_to_points: dict[int, tuple[int, int]] = {}
+                if fg is not None:
+                    for inst in fg.get_instances(cam_name):
+                        if inst.track_idx is None or inst.track_idx in track_to_points:
                             continue
-                        seen_tracks.add(inst.track_idx)
-                        rows.append((cam_name, inst.track_idx))
-
-            self.table.setRowCount(len(rows))
-            for row_i, (cam_name, track_idx) in enumerate(rows):
-                self.table.setItem(row_i, 0, _ro_item(cam_name))
-                track_name = (
-                    self.session.tracks[track_idx]
-                    if 0 <= track_idx < len(self.session.tracks)
-                    else f"t{track_idx}"
+                        n_total = len(inst.points)
+                        n_visible = sum(
+                            1 for pt in inst.points
+                            if pt is not None
+                            and math.isfinite(pt[0])
+                            and math.isfinite(pt[1])
+                        )
+                        track_to_points[inst.track_idx] = (n_visible, n_total)
+                # Sort by displayed track name so the panel reads in the same
+                # order across cameras regardless of per-cam track_idx ordering.
+                tracks_here: list[int] = sorted(
+                    track_to_points.keys(), key=self._track_display_name
                 )
-                self.table.setItem(row_i, 1, _ro_item(f"{track_idx} ({track_name})"))
 
-                combo = QComboBox()
-                self._fill_identity_combo(combo)
+                if not tracks_here:
+                    # Reserve visual space under empty cameras with a muted
+                    # placeholder row — non-selectable, non-interactive.
+                    ph = QTreeWidgetItem(["(no instances)", "", ""])
+                    ph_font = ph.font(0)
+                    ph_font.setItalic(True)
+                    ph.setFont(0, ph_font)
+                    ph.setForeground(0, QColor("#888888"))
+                    ph.setFlags(ph.flags() & ~Qt.ItemIsSelectable & ~Qt.ItemIsEnabled)
+                    cam_item.addChild(ph)
+                    continue
 
-                effective_id = self.session.get_identity_id_for_track(
-                    self._current_frame, cam_name, track_idx
-                )
-                combo.setCurrentIndex(self._find_combo_index(combo, effective_id))
+                for track_idx in tracks_here:
+                    track_name = self._track_display_name(track_idx)
+                    track_item = QTreeWidgetItem(
+                        [f"{track_idx} ({track_name})", "", ""]
+                    )
+                    track_item.setFlags(track_item.flags() & ~Qt.ItemIsSelectable)
+                    cam_item.addChild(track_item)
 
-                combo.currentIndexChanged.connect(
-                    lambda _idx, r=row_i, cam=cam_name, tr=track_idx, cb=combo:
-                        self._on_identity_changed(r, cam, tr, cb)
-                )
-                self.table.setCellWidget(row_i, 2, combo)
+                    combo = QComboBox()
+                    self._fill_identity_combo(combo)
+                    effective_id = self.session.get_identity_id_for_track(
+                        self._current_frame, cam_name, track_idx
+                    )
+                    combo.setCurrentIndex(self._find_combo_index(combo, effective_id))
+                    combo.currentIndexChanged.connect(
+                        lambda _idx, cam=cam_name, tr=track_idx, cb=combo:
+                            self._on_identity_changed(cam, tr, cb)
+                    )
+                    self.tree.setItemWidget(track_item, 1, combo)
 
-                # Scope: per-frame override vs global
-                per_key = f"{self._current_frame}:{cam_name}:{track_idx}"
-                scope = "frame" if per_key in self.session.frame_identity_map else "global"
-                self.table.setItem(row_i, 3, _ro_item(scope))
+                    # Points: how many of the skeleton's nodes have a
+                    # finite (x, y) for this track's instance at this frame.
+                    # Tooltip carries the "visible / total" context so the
+                    # cell stays compact.
+                    n_visible, n_total = track_to_points.get(track_idx, (0, 0))
+                    track_item.setText(2, str(n_visible))
+                    track_item.setToolTip(
+                        2, f"{n_visible} of {n_total} skeleton nodes visible"
+                    )
+                    track_item.setTextAlignment(
+                        2, Qt.AlignRight | Qt.AlignVCenter
+                    )
 
-                # Color swatch in the Camera cell background
-                ident = self.session.get_identity(effective_id)
-                if ident is not None:
-                    item = self.table.item(row_i, 0)
-                    item.setBackground(QColor(ident.color))
+                    # Identity color swatch behind the track label.
+                    ident = self.session.get_identity(effective_id)
+                    if ident is not None:
+                        track_item.setBackground(0, QColor(ident.color))
         finally:
             self._populating = False
 
@@ -215,7 +388,7 @@ class IdentityAssignmentPanel(QWidget):
 
     # ---- handlers -----------------------------------------------------
 
-    def _on_identity_changed(self, row: int, cam_name: str, track_idx: int, combo: QComboBox) -> None:
+    def _on_identity_changed(self, cam_name: str, track_idx: int, combo: QComboBox) -> None:
         if self._populating:
             return
         new_id = combo.currentData()
@@ -234,6 +407,36 @@ class IdentityAssignmentPanel(QWidget):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.session.add_track(dlg.track_name())
 
+    def _track_frames(self) -> None:
+        """Open the Track Frames dialog, then run track_all over the session."""
+        from track_dialog import TrackFramesDialog, run_track_all_with_progress
+
+        dlg = TrackFramesDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        num_animals = dlg.num_animals()
+
+        # Disable the button while running so a second click can't re-enter.
+        self.track_frames_btn.setEnabled(False)
+        try:
+            history = run_track_all_with_progress(
+                self.session,
+                parent=self,
+                num_animals=num_animals,
+            )
+        finally:
+            self.track_frames_btn.setEnabled(True)
+
+        if history is None:
+            return
+        # track_all already fires session signals as it runs; this final
+        # refresh just makes sure the assignments table matches the new
+        # identity map for the currently-selected frame.
+        self._refresh()
+        self._refresh_identities_legend()
+        self.identityAssignmentChanged.emit()
+
     def _on_mode_track_toggled(self, checked: bool) -> None:
         if checked:
             self.session.set_color_mode("track")
@@ -241,6 +444,57 @@ class IdentityAssignmentPanel(QWidget):
     def _on_mode_id_toggled(self, checked: bool) -> None:
         if checked:
             self.session.set_color_mode("identity")
+
+    def _on_node_size_changed(self, slider_val: int) -> None:
+        # Map slider [1..40] -> radius [0.5..20.0] in 0.5 increments.
+        radius = slider_val / 2.0
+        self.node_size_value.setText(f"{radius:.1f}")
+        self.session.set_node_size(radius)
+
+    def _on_edge_width_changed(self, slider_val: int) -> None:
+        # Map slider [1..40] -> width [0.5..20.0] in 0.5 increments.
+        width = slider_val / 2.0
+        self.edge_width_value.setText(f"{width:.1f}")
+        self.session.set_edge_width(width)
+
+    def _on_show_id_labels_toggled(self, checked: bool) -> None:
+        self.session.set_show_identity_labels(checked)
+
+    def _show_group_graph(self) -> None:
+        """Open (or raise) the non-modal group-graph window.
+
+        Lazily imports `graph_window` so the matplotlib backend is only
+        loaded if the user actually clicks the button.
+        """
+        if self._graph_window is None:
+            from graph_window import GroupGraphWindow
+            self._graph_window = GroupGraphWindow(
+                self.session, self._current_frame, parent=self.window()
+            )
+        else:
+            # If the window was opened from a different frame previously, jump
+            # to the panel's current frame on each re-open.
+            self._graph_window.set_frame(self._current_frame)
+        self._graph_window.show()
+        self._graph_window.raise_()
+        self._graph_window.activateWindow()
+
+    def _show_triangulation_3d(self) -> None:
+        """Open (or raise) the 3D triangulation viewport. Lazily imports
+        `triangulation_3d_window` so the pyqtgraph/OpenGL stack is only
+        loaded when the user actually opens the window."""
+        if self._triangulation_window is None:
+            from triangulation_3d_window import Triangulation3DWindow
+            # Parent is the LucidLiteWindow so `parent.currentFrameChanged`
+            # is reachable for the auto-follow connect inside the dialog.
+            self._triangulation_window = Triangulation3DWindow(
+                self.session, self._current_frame, parent=self.window()
+            )
+        else:
+            self._triangulation_window.set_frame(self._current_frame)
+        self._triangulation_window.show()
+        self._triangulation_window.raise_()
+        self._triangulation_window.activateWindow()
 
     def _sync_color_mode_ui(self, mode: str) -> None:
         self.color_mode_track_btn.blockSignals(True)
