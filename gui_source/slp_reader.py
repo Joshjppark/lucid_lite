@@ -79,10 +79,27 @@ def merge_project_slp_into_session(
     to bind calibration entries to subfolder names (eg. lowercase, strip
     `cam_` prefix); we use it to resolve videos → calibrated camera names.
     """
+    labels = sio.load_slp(str(slp_path))
+    return merge_sio_labels_into_session(session, labels, cam_key_fn=cam_key_fn)
+
+
+def merge_sio_labels_into_session(
+    session: Session,
+    labels: "sio.Labels",
+    cam_key_fn=None,
+) -> dict[str, int]:
+    """Dispatch an in-memory multi-video `sio.Labels` into the Session by camera.
+
+    Same logic as `merge_project_slp_into_session` but for a `sio.Labels` already
+    in memory (the canonical label object now — built by `labels.from_folder` /
+    `labels.from_aggregated_h5`, or any SLEAP project). Each `LabeledFrame.video`
+    is matched to a calibrated camera by filename, and its instances are added to
+    `session.frame_groups[frame_idx].instances[cam]`.
+
+    Returns `{camera_name: n_instances_loaded}`.
+    """
     if cam_key_fn is None:
         from session_loader import _cam_key as cam_key_fn  # type: ignore
-
-    labels = sio.load_slp(str(slp_path))
 
     if session.skeleton is None and labels.skeletons:
         session.skeleton = skeleton_from_sio(labels.skeletons[0])

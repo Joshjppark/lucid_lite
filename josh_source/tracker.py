@@ -329,6 +329,9 @@ class SingleFrameTrack:
             edges:np.ndarray = self._calc_edge(self.cam_map[cam1], self.cam_map[cam2])
             edge_dict[(cam1, cam2)] = edges
 
+            if edges.size == 0:
+                continue
+
             # remove columns whose values are all above threshold
             valid_cols = np.min(edges, axis=0) < self.EPIPOLE_THRESHOLD
             edges = edges[:, valid_cols]
@@ -400,7 +403,7 @@ class SingleFrameTrack:
                         explored.append(neighbor)
 
             if len(group) < 2:
-                for v in group: self.nonmatch_instances.extend(self.instance_list[v])
+                for v in group: self.nonmatch_instances.append(self.instance_list[v])
                 continue
 
             # valid = Group.is_valid(group=group, instance_list=self.instance_list)
@@ -468,7 +471,7 @@ class SingleFrameTrack:
             groups = []
             for group in list(distinct_groups.values()):
                 if len(group) < 2:
-                    for v in group: self.nonmatch_instances.extend(self.instance_list[v])    
+                    for v in group: self.nonmatch_instances.append(self.instance_list[v])    
                 elif Group.is_valid(group, self.instance_list):
                     groups.append(Group(group, self.instance_list, self.cam_map, self.proj_cache))
                 else:
@@ -476,7 +479,7 @@ class SingleFrameTrack:
                     fixed_groups = self._fix_group(group)
                     for fixed_group in fixed_groups:
                         if len(fixed_group) < 2:
-                            for v in group: self.nonmatch_instances.extend(self.instance_list[v])
+                            for v in group: self.nonmatch_instances.append(self.instance_list[v])
                         else:
                             groups.append(Group(fixed_group, self.instance_list, self.cam_map, self.proj_cache))
 
@@ -572,46 +575,53 @@ class SingleFrameTrack:
 
         matchable_ids =  [i for i, p in self.prev_trackIds.items() if p.last_points3d is not None]
 
-        # populate the cost matrix
-        costs = np.full((curr_groups_num, len(matchable_ids)), np.inf)
-        for col, id_ in enumerate(matchable_ids):
-            for row in range(curr_groups_num):
-                
-                # print(self.groups[row].points3d)
-                assert self.groups[row].points3d is not None
-                last = self.prev_trackIds[id_].last_points3d
 
-                costs[row, col] = np.nanmean(
-                    np.linalg.norm(
-                        self.groups[row].points3d-last,
-                        axis=1,
+        if len(matchable_ids) == 0 or curr_groups_num == 0:
+            final_matches = np.empty((0, 2), dtype=int)
+            costs = None
+        else:
+
+
+            # populate the cost matrix
+            costs = np.full((curr_groups_num, len(matchable_ids)), np.inf)
+            for col, id_ in enumerate(matchable_ids):
+                for row in range(curr_groups_num):
+                    
+                    # print(self.groups[row].points3d)
+                    assert self.groups[row].points3d is not None
+                    last = self.prev_trackIds[id_].last_points3d
+
+                    costs[row, col] = np.nanmean(
+                        np.linalg.norm(
+                            self.groups[row].points3d-last,
+                            axis=1,
+                        )
                     )
-                )
 
-        # first: assign best matches - matches that are minumum along cost row and columns
-        row_mins = np.argmin(costs, axis=1)
-        col_mins = np.argmin(costs, axis=0)
-        best_match_rows = np.where(col_mins[row_mins] == np.arange(costs.shape[0]))[0]
-        best_match_cols = row_mins[best_match_rows]
+            # first: assign best matches - matches that are minumum along cost row and columns
+            row_mins = np.argmin(costs, axis=1)
+            col_mins = np.argmin(costs, axis=0)
+            best_match_rows = np.where(col_mins[row_mins] == np.arange(costs.shape[0]))[0]
+            best_match_cols = row_mins[best_match_rows]
 
-        mutual_matches = np.column_stack((best_match_rows, best_match_cols))
+            mutual_matches = np.column_stack((best_match_rows, best_match_cols))
 
-        # second: assign remaining 'non' mutual matches with hungarian
-        remaining_r = np.setdiff1d(np.arange(costs.shape[0]), best_match_rows)
-        remaining_c = np.setdiff1d(np.arange(costs.shape[1]), best_match_cols)
-        submatrix = costs[np.ix_(remaining_r, remaining_c)]
+            # second: assign remaining 'non' mutual matches with hungarian
+            remaining_r = np.setdiff1d(np.arange(costs.shape[0]), best_match_rows)
+            remaining_c = np.setdiff1d(np.arange(costs.shape[1]), best_match_cols)
+            submatrix = costs[np.ix_(remaining_r, remaining_c)]
 
-        local_r, local_c = linear_sum_assignment(submatrix)
-        global_r = remaining_r[local_r]
-        global_c = remaining_c[local_c]
-        hungarian_matches = np.column_stack((global_r, global_c))
+            local_r, local_c = linear_sum_assignment(submatrix)
+            global_r = remaining_r[local_r]
+            global_c = remaining_c[local_c]
+            hungarian_matches = np.column_stack((global_r, global_c))
 
-        final_matches = np.vstack((mutual_matches, hungarian_matches))
+            final_matches = np.vstack((mutual_matches, hungarian_matches))
     
-        # assert number of matches is number of groups in curr frame
-        if len(np.unique(final_matches[:, 0])) != curr_groups_num:
-            print(f'{self.frame_idx} has {len(np.unique(final_matches[:, 0]))} matches with {len(self.groups)} groups ')
-        # assert len(np.unique(final_matches[:, 0])) == curr_groups_num
+            # assert number of matches is number of groups in curr frame
+            # if len(np.unique(final_matches[:, 0])) != curr_groups_num:
+                # print(f'{self.frame_idx} has {len(np.unique(final_matches[:, 0]))} matches with {len(self.groups)} groups ')
+            # assert len(np.unique(final_matches[:, 0])) == curr_groups_num
 
         # initialize and poopulate trackIds dict
         trackIds = {}
@@ -843,14 +853,20 @@ class MultiFrameTrack:
         prev_trackIds = None
         if not self.max_ids:
             max_ = 0
-            for i in range(self.session.max_frame):
-                lst = list(self.session.frame_group(i).instances.values())
+            for i in range(self.end):
+                try:
+                    lst = list(self.session.frame_group(i).instances.values())
+                except:
+                    print(i)
+                    continue
+
                 num = max((len(sublist) for sublist in lst), default=0)
                 max_ = max(max_, num)
             self.max_ids = max_
 
         for frame_idx in tqdm(range(self.start, self.end)):
             fg = self.session.frame_group(frame_idx)
+            if fg is None: continue
 
             sft = SingleFrameTrack(
                 fg, self.session.cameras,

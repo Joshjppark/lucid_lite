@@ -39,52 +39,76 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return p.parse_args(argv[1:])
 
 
-def main(argv: list[str]) -> int:
-    args = _parse_args(argv)
+def main(source: "list[str] | str | Path | object | None" = None, *,
+         labels: "object | None" = None, comms: bool = False):
+    """Launch the GUI.
 
+    `source` decouples the GUI from its label/detection input. Accepts:
+      * a `pose_data.Session` — use a pre-built session as-is;
+      * a CLI argv `list[str]` (e.g. ``["main.py", folder, "--comms"]``) — legacy;
+      * a folder `str`/`Path` — build a session from that folder;
+      * `None` — open a folder picker.
+
+    `labels` is an optional multi-video `sleap_io.Labels` (e.g. from
+    `labels.from_aggregated_h5`) supplying the detections; the folder still
+    supplies calibration + videos. If omitted, detections are auto-discovered.
+    """
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
-    # app = QApplication(argv)
     app.setApplicationName("LUCID-Lite")
 
     # Anchor widget so QMessageBox/QFileDialog always have a live parent —
     # parent=None before any top-level is shown segfaults PySide6 on macOS.
     anchor = QWidget()
 
-    import comms
+    import comms as comms_mod
+    import labels as labels_mod
     from main_window import LucidLiteWindow
-    from pose_data import Session
 
-    folder: Path | None = None
-    if args.folder is not None:
-        folder = Path(args.folder).expanduser().resolve()
-        if not folder.is_dir():
-            _error(anchor, "LUCID-Lite", f"Not a directory: {folder}")
-            return 2
+    want_comms = comms
 
-    if folder is None:
-        picked = QFileDialog.getExistingDirectory(anchor, "Open LUCID Session Folder")
-        if not picked:
-            return 0
-        folder = Path(picked)
+    # A pre-built Session (duck-typed so it survives %autoreload) is used as-is.
+    if source is not None and not isinstance(source, (list, tuple, str, Path)) \
+            and hasattr(source, "frame_groups"):
+        session = source
+    else:
+        # argv list / folder path / None -> resolve a folder + comms flag.
+        if isinstance(source, (str, Path)):
+            folder_arg = str(source)
+        else:
+            args = _parse_args(source if source is not None else ["main.py"])
+            folder_arg = args.folder
+            want_comms = want_comms or args.comms
 
-    try:
-        session = Session.load_from_folder(folder)
-    except Exception as exc:
-        traceback.print_exc()
-        _error(anchor, "Load failed", f"{type(exc).__name__}: {exc}")
-        return 1
+        folder: Path | None = None
+        if folder_arg is not None:
+            folder = Path(folder_arg).expanduser().resolve()
+            if not folder.is_dir():
+                _error(anchor, "LUCID-Lite", f"Not a directory: {folder}")
+                return 2
+        if folder is None:
+            picked = QFileDialog.getExistingDirectory(anchor, "Open LUCID Session Folder")
+            if not picked:
+                return 0
+            folder = Path(picked)
+
+        try:
+            session = labels_mod.build_session(folder, labels)
+        except Exception as exc:
+            traceback.print_exc()
+            _error(anchor, "Load failed", f"{type(exc).__name__}: {exc}")
+            return 1
 
     window = LucidLiteWindow(session)
     window.show()
 
-    if args.comms:
-        comms.start_embedded_kernel({
+    if want_comms:
+        comms_mod.start_embedded_kernel({
             "app": app,
             "window": window,
             "session": session,
-            "comms": comms,
+            "comms": comms_mod,
         })
 
     # Always hand back (app, window). When invoked from a Jupyter notebook

@@ -16,11 +16,20 @@ from pathlib import Path
 
 from analysis_h5_reader import is_analysis_h5, merge_analysis_h5_into_session
 from calibration import find_calibration, parse_calibration_json, parse_calibration_toml
-from pose_data import InstanceGroup, Session
+from pose_data import Camera, InstanceGroup, Session
 from slp_reader import merge_project_slp_into_session, merge_slp_into_session
 
 
-def load_session_from_folder(folder: Path) -> Session:
+def load_session_structure(folder: Path) -> tuple[Session, list[tuple[str, Path]]]:
+    """Load everything EXCEPT pose detections: calibration, cameras, and
+    per-camera video paths. Returns `(session, resolved)` where `resolved` is
+    `[(camera_name, subfolder), ...]`.
+
+    Detections are merged separately — either auto-discovered
+    (`load_session_from_folder`) or supplied as an explicit `sio.Labels`
+    (`labels.build_session`). This is what decouples the label source from the
+    session/GUI.
+    """
     folder = Path(folder).resolve()
     if not folder.is_dir():
         raise ValueError(f"Not a directory: {folder}")
@@ -55,7 +64,6 @@ def load_session_from_folder(folder: Path) -> Session:
 
     if not session.has_calibration:
         # Synthesize camera records from folder names so downstream code has them.
-        from pose_data import Camera
         session.cameras = [
             Camera(name=name, matrix=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
                    dist=[0, 0, 0, 0, 0], rvec=[0, 0, 0], tvec=[0, 0, 0],
@@ -69,21 +77,24 @@ def load_session_from_folder(folder: Path) -> Session:
         if video is not None:
             session.video_paths[cam_name] = video
 
-    # Label source preference (matches the JS LUCID web app):
-    #
-    #   1. Root-level `project.slp` (or any *.slp directly under `folder`) —
-    #      the canonical multi-video SLEAP project file. This is what the JS
-    #      app loads, and it covers ALL calibrated cameras in one shot,
-    #      including ones that don't have their own per-cam .analysis.h5
-    #      (eg. `side/` and `sideL/` in test fixtures).
-    #   2. Per-camera `.slp` inside each `<cam>/` subfolder.
-    #   3. Per-camera `.analysis.h5` fallback (proofread predictions).
-    #
-    # Earlier versions skipped step 1 and silently dropped cameras with no
-    # per-cam label file — which caused the tracker to run on fewer
-    # cross-view constraints than the JS app and produce 2× more transient
-    # identities (lucid-lite#track-frames-discrepancy).
-    root_slp = _first_with_suffix(folder, ".slp")
+    return session, resolved
+
+
+def load_session_from_folder(folder: Path) -> Session:
+    """Build a Session with detections AUTO-DISCOVERED from the folder.
+
+    Label source preference (matches the JS LUCID web app):
+      1. Root-level `project.slp` — canonical multi-video SLEAP project,
+         covering all calibrated cameras (incl. ones lacking a per-cam file).
+      2. Per-camera `.slp` inside each `<cam>/` subfolder.
+      3. Per-camera `.analysis.h5` fallback (proofread predictions).
+
+    For an explicit label source, build a `sio.Labels` (e.g. via
+    `labels.from_aggregated_h5`) and call `labels.build_session(folder, labels)`.
+    """
+    session, resolved = load_session_structure(folder)
+
+    root_slp = _first_with_suffix(session.folder, ".slp")
     if root_slp is not None:
         merge_project_slp_into_session(session, root_slp, cam_key_fn=_cam_key)
     else:
@@ -95,7 +106,6 @@ def load_session_from_folder(folder: Path) -> Session:
             elif h5 is not None:
                 merge_analysis_h5_into_session(session, h5, cam_name)
 
-    # Build InstanceGroups (mirrors slp-merge.js:151–180)
     rebuild_instance_groups(session)
     return session
 

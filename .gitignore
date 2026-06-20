@@ -3,7 +3,10 @@
 Thumbs.db
 uv.lock
 
-
+# folders
+/benchmark
+/other_trackers
+/prompts
 
 .prompts/
 .claude/
@@ -18,5 +21,5 @@ __pycache__/
 *.md
 !README.md
 *.slp
-
+*.sh
 

@@ -652,11 +652,11 @@ class SingleFrameTrack:
 
 
         # assign matches to id's with uninitialized points
-        open_ids = [i for i, p in self.prev_trackIds.items() if p.last_points3d is None]
         # CLAUDE FIX (consistency): materialize matched rows as a set
         # so the membership check is unambiguous even when
         # final_matches is the empty (0, 2) array from the early-exit
         # branch above.
+        open_ids = [i for i, p in self.prev_trackIds.items() if p.last_points3d is None]
         matched_rows = set(int(r) for r in final_matches[:, 0]) if final_matches.size else set()
         for row in (r for r in range(curr_groups_num) if r not in matched_rows):
             if not open_ids:
