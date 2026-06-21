@@ -11,14 +11,15 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-from PySide6.QtCore import QMimeData, QPoint, QRect, Qt, Signal
+from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QRect, Qt, Signal
 from PySide6.QtGui import (
     QAction, QColor, QDrag, QGuiApplication, QKeySequence, QPainter, QPixmap,
     QShortcut,
 )
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-    QPushButton, QSizePolicy, QSplitter, QTabBar, QVBoxLayout, QWidget,
+    QAbstractSpinBox, QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QSplitter,
+    QTabBar, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from assignment_panel import IdentityAssignmentPanel
@@ -914,12 +915,33 @@ class LucidLiteWindow(QMainWindow):
         sc_left = QShortcut(QKeySequence(Qt.Key_Left), self)
         sc_left.setContext(Qt.ApplicationShortcut)
         sc_left.activated.connect(self._step_prev_frame)
-        # Space toggles playback application-wide. Same pattern so the
-        # shortcut fires when the focus is on a child dialog (3D viewer,
-        # group-graph window) without needing per-dialog wiring.
+        # Space toggles playback application-wide. QShortcut +
+        # Qt.ApplicationShortcut is NOT enough on its own — focused
+        # QPushButton / QCheckBox / QToolButton (which the graph window
+        # and 3D viewer dialogs are full of) consume Space in their own
+        # keyPressEvent as the "click" key BEFORE the shortcut engine
+        # gets to dispatch it, so the shortcut never fires while those
+        # dialogs have focus. The QShortcut still covers a plain main
+        # window with no button focused; the application-level event
+        # filter below catches everything else.
         sc_space = QShortcut(QKeySequence(Qt.Key_Space), self)
         sc_space.setContext(Qt.ApplicationShortcut)
         sc_space.activated.connect(self._toggle_play)
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        # App-wide Space handler — runs before focused widgets see the key.
+        # Skipped when a text-entry widget has focus so typing a space into
+        # a QLineEdit / QTextEdit / QSpinBox stays normal.
+        if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Space:
+            if event.modifiers() & ~Qt.KeypadModifier:
+                return super().eventFilter(obj, event)
+            focused = QApplication.focusWidget()
+            if isinstance(focused, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox)):
+                return super().eventFilter(obj, event)
+            self._toggle_play()
+            return True
+        return super().eventFilter(obj, event)
 
     def _toggle_play(self) -> None:
         if hasattr(self, "playback"):

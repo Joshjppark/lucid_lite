@@ -172,9 +172,10 @@ class SingleFrameTrack:
     def __init__(
             self,
             fg: FrameGroup,
-            cameras: Camera,
+            cameras: list[Camera],
             proj_cache: ProjCache,
             node_weights: np.ndarray,
+            next_avail_id: int,
             prev_trackIds: dict[int, TrackedIdentity] = None,
             max_ids: int = None,
         ) -> None:
@@ -191,13 +192,14 @@ class SingleFrameTrack:
         self.node_weights = np.array(list(node_weights.values()))
         self.prev_trackIds = prev_trackIds
         self.max_ids = max_ids
+        self.next_avail_id = next_avail_id
 
 
         # attributes to be updated a future time
         self._camera_pairs = None
         self.adjacency_matrix = None
         self.edges = None
-        self.groups = None
+        self.groups: list[Group] | None = None
         self.trackIds = None
         self.visible_ids = []
         self.invalid_instances = []
@@ -205,21 +207,22 @@ class SingleFrameTrack:
         self.nonmatch_groups = []
         self.match_conflicts: dict[tuple(str, str): tuple(int, int)] = []
 
-
+        # camera attributes
         self.cam_count_dict: dict[str, int] = {cam: len(insts) for cam, insts in fg.instances.items()}
         self.cameras = [c for c in cameras if self.cam_count_dict.get(c.name, 0)]
         self.cam_map = {c.name: c for c in self.cameras}
 
-        # hyper parameters
+        # hyperparameters
         self.EPIPOLE_THRESHOLD = 9
+        self.TEMPORAL_THRESHOLD = 60
+        self.FRAMES_MISSING_THRESHOLD = 40
         self.MIN_NODES = 3
-
 
         # save instances to dict and list
         instance_by_cam, inst_list = self.get_instances(fg)
 
         self.n_insts = len(inst_list)
-        self.instance_by_cam: dict[tuple[int, np.ndarray]] = instance_by_cam
+        self.instance_by_cam: dict[str, tuple[int, np.ndarray]] = instance_by_cam
         # key: cam name
         # value: (instance_count:int, points: np.ndarray)
 
@@ -280,7 +283,6 @@ class SingleFrameTrack:
         
         self.adjacency_matrix = np.full((self.n_insts, self.n_insts), np.inf)
         self.edges = self._calc_edge_weights()
-        # self.groups = self._run_bfs()
         self.groups = self._run_union_find()
 
         if self.prev_trackIds is None:
@@ -288,9 +290,8 @@ class SingleFrameTrack:
             self.trackIds = self._init_identities() 
         else:
             # subsequent frames - assign identites to match prev frame
-
-            # assert all groups are valid
             if not all([g.valid for g in self.groups]):
+                # assert all groups are valid
                 raise AssertionError
 
             self.trackIds = self._match_prev_groups()
@@ -468,7 +469,7 @@ class SingleFrameTrack:
 
 
             # check validity of groups
-            groups = []
+            groups: list[Group] = []
             for group in list(distinct_groups.values()):
                 if len(group) < 2:
                     for v in group: self.nonmatch_instances.append(self.instance_list[v])    
@@ -482,8 +483,6 @@ class SingleFrameTrack:
                             for v in group: self.nonmatch_instances.append(self.instance_list[v])
                         else:
                             groups.append(Group(fixed_group, self.instance_list, self.cam_map, self.proj_cache))
-
-
 
             return groups
 
@@ -545,6 +544,7 @@ class SingleFrameTrack:
 
         trackIds = {}
         # assign identities with visible tracks
+        assert type(self.groups) == list
         for i, group in enumerate(self.groups):
             trackIds[i] = TrackedIdentity(
                 id = i,
@@ -552,13 +552,9 @@ class SingleFrameTrack:
                 last_points3d=group.points3d,
             )
             self.visible_ids.append(i)
+            self.next_avail_id += 1
 
-        # assign leftover identities to reach max_ids
-        for i in range(len(self.groups), self.max_ids):
-            trackIds[i] = TrackedIdentity(
-                id = i,
-                group = None,
-            )
+        self._costs = None
 
         return trackIds
 
@@ -570,16 +566,23 @@ class SingleFrameTrack:
         so that identities can be consist across consecutive frames
         '''
 
-        curr_groups_num = len(self.groups)
-        prev_groups_num = len(self.prev_trackIds)
+        matchable_ids =  [i for i, p in self.prev_trackIds.items() if p.frames_hidden < self.FRAMES_MISSING_THRESHOLD]
 
-        matchable_ids =  [i for i, p in self.prev_trackIds.items() if p.last_points3d is not None]
+        def _get_matches():
+            assert self.groups is not None
+            
+            curr_groups_num = len(self.groups)
+            prev_groups_num = len(matchable_ids)
 
 
-        if len(matchable_ids) == 0 or curr_groups_num == 0:
-            final_matches = np.empty((0, 2), dtype=int)
-            costs = None
-        else:
+            if len(matchable_ids) == 0 or curr_groups_num == 0:
+                # return null values
+                costs = None
+                valid_matches = np.empty((0, 2), dtype=int)
+                unmatched_curr = np.arange(curr_groups_num)
+                unmatched_prev = np.arange(prev_groups_num)
+                
+                return costs, valid_matches, unmatched_curr, unmatched_prev
 
 
             # populate the cost matrix
@@ -598,86 +601,96 @@ class SingleFrameTrack:
                         )
                     )
 
-            # first: assign best matches - matches that are minumum along cost row and columns
+            # first: assign best matches - matches that are minumum in BOTH their respective column and row
             row_mins = np.argmin(costs, axis=1)
             col_mins = np.argmin(costs, axis=0)
             best_match_rows = np.where(col_mins[row_mins] == np.arange(costs.shape[0]))[0]
             best_match_cols = row_mins[best_match_rows]
-
             mutual_matches = np.column_stack((best_match_rows, best_match_cols))
 
-            # second: assign remaining 'non' mutual matches with hungarian
+            # second: assign remaining 'non' mutual matches with hungarian as long as they are above
             remaining_r = np.setdiff1d(np.arange(costs.shape[0]), best_match_rows)
             remaining_c = np.setdiff1d(np.arange(costs.shape[1]), best_match_cols)
             submatrix = costs[np.ix_(remaining_r, remaining_c)]
-
+            
+            # run hungarian on suboptimal-matrix
             local_r, local_c = linear_sum_assignment(submatrix)
             global_r = remaining_r[local_r]
             global_c = remaining_c[local_c]
             hungarian_matches = np.column_stack((global_r, global_c))
+            
+            # get all matches but prune out ones above temporal threshold
+            all_matches = np.vstack((mutual_matches, hungarian_matches))
+            if len(all_matches) > 0:
+                match_costs = costs[all_matches[:, 0], all_matches[:, 1]]
+                valid_matches = all_matches[match_costs <= self.TEMPORAL_THRESHOLD]
+            else:
+                valid_matches = np.empty((0, 2), dtype=int)
 
-            final_matches = np.vstack((mutual_matches, hungarian_matches))
-    
-            # assert number of matches is number of groups in curr frame
-            # if len(np.unique(final_matches[:, 0])) != curr_groups_num:
-                # print(f'{self.frame_idx} has {len(np.unique(final_matches[:, 0]))} matches with {len(self.groups)} groups ')
-            # assert len(np.unique(final_matches[:, 0])) == curr_groups_num
+            # get unmatched curr/prev ids
+            unmatched_curr = np.setdiff1d(np.arange(curr_groups_num),  valid_matches[:, 0])
+            unmatched_prev = np.setdiff1d(np.arange(prev_groups_num),  valid_matches[:, 1])
 
-        # initialize and poopulate trackIds dict
-        trackIds = {}
+            return costs, valid_matches, unmatched_curr, unmatched_prev
 
-        # assign matches to tracks that exist in prev frame
-        for (row, col) in final_matches:
-            id_ = int(matchable_ids[col])
-            trackIds[id_] = TrackedIdentity(
-                id = id_,
-                group = self.groups[row],
-                last_points3d = self.groups[row].points3d,
-            )
-            # self.groups[row].id = id_
-            self.visible_ids.append(id_)
+            
+        def _assign_ids(valid_matches, unmatched_curr, unmatched_prev):
+            '''
+            Makes and assign TrackedIdentity of current frame to ID of previous TrackedIdentity
+            '''
 
+            # initialize and populate trackIds dict
+            trackIds = {}
 
-        # assign matches to id's with uninitialized points
-        open_ids = [i for i, p in self.prev_trackIds.items() if p.last_points3d is None]
-        for row in (r for r in range(curr_groups_num) if r not in final_matches[:, 0]):
-            if not open_ids:
-                # all ids are used up, remaining groups are not matched
-                self.nonmatch_groups.append(self.groups[row])
-                continue
-            id_ = open_ids.pop(0)
-
-
-            assert id_ not in trackIds
-
-            trackIds[id_] = TrackedIdentity(
-                id = id_,
-                group = self.groups[row],
-                last_points3d = self.groups[row].points3d,
-            )
-            self.groups[row].id = id_
-            self.visible_ids.append(id_)
-
-        # Propagate id's that are hidden
-        for id_, prev_track in self.prev_trackIds.items():
-            if id_ not in trackIds:
+            # assign matches to tracks that exist in prev frame
+            for (row, col) in valid_matches:
+                id_ = int(matchable_ids[col])
                 trackIds[id_] = TrackedIdentity(
                     id = id_,
-                    group = None,
-                    last_points3d = prev_track.last_points3d,
-                    frames_hidden = prev_track.frames_hidden + 1,
+                    group = self.groups[row],
+                    last_points3d = self.groups[row].points3d,
                 )
-                # self.groups[row].id = id_
+                self.visible_ids.append(id_)
 
-        # save groups that were not assigned to an ID
-        for group in self.groups:
-            if group.id is None:
-                print(f'{self.frame_idx} Group {group} not assigned ')
+
+            # assign current unmatched Instance to a new ID
+            for curr in unmatched_curr:
+                id_ = self.next_avail_id
+                trackIds[id_] = TrackedIdentity(
+                    id = id_,
+                    group = self.groups[curr],
+                    last_points3d = self.groups[curr].points3d,
+                )
+                self.visible_ids.append(id_)
+                self.next_avail_id += 1
+
+            # increase frames_hidden for unmatched prev
+            for prev in unmatched_prev:
+                id_ = int(matchable_ids[prev])
+                track = self.prev_trackIds[id_]
+
+                trackIds[id_] = TrackedIdentity(
+                    id = id_,
+                    group=None,
+                    last_points3d= track.last_points3d,
+                    frames_hidden=track.frames_hidden + 1,
+                )
+
+            # save groups that were not assigned to an ID
+            for group in self.groups:
+                if group.id is None:
+                    print(f'{self.frame_idx} Group {group} not assigned ')
+
+            return trackIds
+
+
+        costs, valid_matches, unmatched_curr, unmatched_prev = _get_matches()
+        trackIds = _assign_ids(valid_matches, unmatched_curr, unmatched_prev)
 
 
         # debugging
         self._costs = costs
-        self._final_matches = final_matches
+        self._valid_matches = valid_matches
         self._matchable_ids = matchable_ids
 
         return trackIds
@@ -831,6 +844,7 @@ class MultiFrameTrack:
         self.end = end if end else window.session.max_frame
         self.palette = palette if palette else {}
         self.max_ids = max_ids
+        self.next_avail_id = 0
 
         if node_weights is None:
             self.node_weights = {node: 1 for node in self.session.skeleton.nodes}
@@ -871,8 +885,10 @@ class MultiFrameTrack:
             sft = SingleFrameTrack(
                 fg, self.session.cameras,
                 node_weights=self.node_weights, proj_cache=self.proj_cache,
-                prev_trackIds=prev_trackIds, max_ids=self.max_ids,
+                prev_trackIds=prev_trackIds, next_avail_id=self.next_avail_id,
+                max_ids=self.max_ids,
             )
+            self.next_avail_id = sft.next_avail_id
             if sft.trackIds:
                 prev_trackIds = sft.trackIds
             self.frames.append(sft)
@@ -950,16 +966,17 @@ class MultiFrameTrack:
 
                 self.session._emit("identity_map_changed")
 
-                # 8. Store the full bundle so graph_window can draw edges from the
-                #    matrix and label them with weights. sft.groups is filtered to
-                #    visible-only (identities with group is None are dropped).
-                # self.session.set_groups_for_frame(
-                #     sft.frame_idx,
-                #     sft.groups,
-                #     adjacency_matrix=sft.adjacency_matrix,
-                #     instance_list=sft.instance_list,
-                #     trackIds=sft.trackIds,
-                # )
+                # 8. Store the full bundle so graph_window + triangulation_3d_window
+                #    can draw edges/skeletons. Both subscribe to
+                #    `session.frame_tracker_groups[frame_idx]` and the
+                #    `groups_changed` signal; without this they stay empty.
+                self.session.set_groups_for_frame(
+                    sft.frame_idx,
+                    sft.groups,
+                    adjacency_matrix=sft.adjacency_matrix,
+                    instance_list=sft.instance_list,
+                    trackIds=sft.trackIds,
+                )
 
                     
 

@@ -4,6 +4,7 @@ Originally inlined in tracking_test.ipynb; extracted here so the notebook
 stays clean and the helpers are importable from other notebooks/scripts.
 """
 from collections.abc import Iterable
+from pathlib import Path
 
 import numpy as np
 from tqdm import tqdm
@@ -39,6 +40,7 @@ def push_frame_assignments(
     palette: dict[int, tuple[str, str]] | None = None,
     node_weights: dict[str, float] | None = None,
     prev_trackIds: dict | None = None,
+    next_avail_id: int = 0,
     max_id: int | None = None,
     seek_to_frame: bool = True,
 ):
@@ -83,7 +85,8 @@ def push_frame_assignments(
     sft = tracker.SingleFrameTrack(
         fg, session.cameras,
         node_weights=node_weights, proj_cache=proj_cache,
-        prev_trackIds=prev_trackIds, max_ids=max_id,
+        prev_trackIds=prev_trackIds, next_avail_id=next_avail_id,
+        max_ids=max_id,
     )
 
     # 2. Derive assignments from sft.trackIds: identity_id -> (cam, track).
@@ -205,6 +208,7 @@ def track_pusher(
     show_graph: bool = False,
     verbose: bool | None = None,
     prev_trackIds: dict | None = None,
+    next_avail_id: int = 0,
     max_id: int | None = None,
 ) -> list[dict]:
     """Push assignments for one or many frames.
@@ -264,12 +268,14 @@ def track_pusher(
             groups, assignments, adj, inst_list, sft = push_frame_assignments(
                 window, frame_idx,
                 palette=palette, node_weights=node_weights,
-                prev_trackIds=prev_trackIds, max_id=max_id,
+                prev_trackIds=prev_trackIds, next_avail_id=next_avail_id,
+                max_id=max_id,
                 # Skip the per-frame seek + decode on every intermediate
                 # frame — only the last frame in the sweep actually moves
                 # the playhead, which is what the user sees.
                 seek_to_frame=is_last,
             )
+            next_avail_id = sft.next_avail_id
             # Forward-propagate only when this frame produced a valid
             # solution. When SingleFrameTrack couldn't resolve identities
             # it leaves sft.trackIds=None; in that case we keep
@@ -325,3 +331,248 @@ def track_pusher(
         gw.show()
 
     return results
+
+
+def swap_detector(source) -> tuple[int, dict[int, list[dict]]]:
+    """Detect identity ↔ SLEAP-track swaps across consecutive frames.
+
+    A "swap" here is: for some persistent lucid_lite identity `id_X` and
+    some camera `cam`, the underlying SLEAP track index that lucid_lite
+    bound to `id_X.cam` changes from frame to frame. The lucid_lite
+    identity stays the same (so motmetrics IDF1 won't fire), but the
+    tracker has matched a different raw SLEAP detection to that identity
+    — which is what `_match_prev_groups`' Hungarian solves for, and what
+    you'd flag in the GUI as "the wrong mouse is wearing id_0 in cam back
+    now".
+
+    Hidden identities (group is None at frame F) are NOT compared at F —
+    their last-known per-cam track is carried forward in the state so the
+    comparison resumes against the last frame they were visible. This
+    means a swap is reported on the *reappearance frame*, not on every
+    hidden frame in between.
+
+    Params:
+    - source: one of
+        - `MultiFrameTrack` (uses `.frames`, each a `SingleFrameTrack`
+          with `.frame_idx` and `.trackIds`)
+        - list of dicts from `track_pusher` (uses `frame_idx` and
+          `trackIds` keys)
+
+    Returns:
+        (n_swaps, swaps) where
+        - n_swaps: total number of (frame, identity, cam) swap events
+        - swaps: dict[frame_idx -> list[ {id, cam, prev_track, new_track} ]]
+          Frames with zero swaps are omitted from the dict.
+    """
+    # Normalize input to an ordered iterable of (frame_idx, trackIds).
+    if hasattr(source, "frames"):
+        pairs = [(sft.frame_idx, sft.trackIds) for sft in source.frames]
+    else:
+        pairs = [(r["frame_idx"], r["trackIds"]) for r in source]
+
+    swaps: dict[int, list[dict]] = {}
+    # last seen (cam -> track_idx) per identity. Persists across hidden
+    # frames so we compare a reappearance against the last visible frame.
+    last_cam_track: dict[int, dict[str, int]] = {}
+
+    for frame_idx, trackIds in pairs:
+        if trackIds is None:
+            continue
+
+        for ident_id, ti in trackIds.items():
+            if ti.group is None:
+                # hidden this frame — leave its last_cam_track entry intact.
+                continue
+
+            curr_map = {cam: tidx for cam, tidx in ti.group.cam_track}
+            prev_map = last_cam_track.get(ident_id)
+
+            if prev_map is not None:
+                for cam, new_track in curr_map.items():
+                    prev_track = prev_map.get(cam)
+                    if prev_track is None or prev_track == new_track:
+                        continue
+                    swaps.setdefault(frame_idx, []).append({
+                        "id": ident_id,
+                        "cam": cam,
+                        "prev_track": prev_track,
+                        "new_track": new_track,
+                    })
+
+            # Update state: merge so cams not present this frame keep
+            # their prior value (carry-forward across partial visibility).
+            merged = dict(prev_map) if prev_map else {}
+            merged.update(curr_map)
+            last_cam_track[ident_id] = merged
+
+    n_swaps = sum(len(v) for v in swaps.values())
+    return n_swaps, swaps
+
+
+def gt_swap_detector(
+    source,
+    gt_dir,
+    cameras: list[str] | None = None,
+    max_distance: float = 50.0,
+    return_metrics: bool = False,
+):
+    """GT-grounded swap detection via motmetrics SWITCH events.
+
+    For each camera, pairs lucid_lite's predicted identities (per
+    frame, per cam) against GT identities loaded from
+    `<gt_dir>/<cam>/*.predictions.proofread.slp.analysis.h5` and runs a
+    `MOTAccumulator`. A SWITCH = a frame where some GT id binds to a
+    different predicted id than it did on its previous matched frame
+    (the canonical "true swap" measure — same definition as
+    `run_lucid_gt_first10k_session72.py`).
+
+    Predicted centroids per cam come from `sft.instance_list`: nanmean
+    of the 2D keypoints for the instance whose (cam, sleap_track_idx)
+    pair matches `cam_track` of the lucid identity.
+
+    Params:
+    - source: MultiFrameTrack or track_pusher results list.
+    - gt_dir: Path (or str) to the session GT mirror containing per-cam
+      subdirs; each must have one `*.predictions.proofread.slp.analysis.h5`.
+    - cameras: subset of cam names to score. Default = every cam with
+      both predictions and a GT h5.
+    - max_distance: pixel gate (motmetrics treats anything beyond as a
+      non-match). Passed to `norm2squared_matrix` as `max_d2 = d**2`.
+    - return_metrics: if True, also return a per-cam dict of
+      idf1/idp/idr/mota/recall/precision/switches.
+
+    Returns:
+        (n_switches, switches_by_frame) — or
+        (n_switches, switches_by_frame, per_cam_metrics) if
+        return_metrics=True.
+
+        switches_by_frame: {frame_idx -> [ {cam, gt_id, pred_id} ]}.
+        Frames with zero switches omitted.
+    """
+    import h5py
+    import motmetrics as mm
+
+    # Normalize input → list of SingleFrameTrack
+    if hasattr(source, "frames"):
+        frames = source.frames
+    else:
+        frames = [r["sft"] for r in source]
+    if not frames:
+        empty: tuple = (0, {}, {}) if return_metrics else (0, {})
+        return empty
+
+    # Discover cams present in pred (any instance_list entry) and gt.
+    pred_cams: set[str] = set()
+    for sft in frames:
+        for _, cam, _ in sft.instance_list:
+            pred_cams.add(cam)
+
+    gt_dir = Path(gt_dir)
+    cam_to_gt: dict[str, Path] = {}
+    for cam in pred_cams:
+        cdir = gt_dir / cam
+        if not cdir.is_dir():
+            continue
+        h5s = sorted(cdir.glob("*.predictions.proofread.slp.analysis.h5"))
+        if h5s:
+            cam_to_gt[cam] = h5s[0]
+
+    if cameras is None:
+        cameras = sorted(cam_to_gt)
+    else:
+        cameras = [c for c in cameras if c in cam_to_gt]
+    if not cameras:
+        empty = (0, {}, {}) if return_metrics else (0, {})
+        return empty
+
+    # GT centroids per cam: (n_frames, n_animals, 2).
+    gt_centroids_by_cam: dict[str, np.ndarray] = {}
+    for cam in cameras:
+        with h5py.File(cam_to_gt[cam], "r") as f:
+            # tracks: (n_animals, 2, n_nodes, n_frames) -> (n_frames, n_animals, n_nodes, 2)
+            tr = f["tracks"][:].transpose(3, 0, 2, 1)
+        gt_centroids_by_cam[cam] = np.nanmean(tr, axis=2)
+
+    # Predicted centroids per cam: {cam: {frame_idx: {ident_id: (2,) array}}}.
+    pred_by_cam: dict[str, dict[int, dict[int, np.ndarray]]] = {c: {} for c in cameras}
+    for sft in frames:
+        if sft.trackIds is None:
+            continue
+        ct_to_id: dict[tuple[str, int], int] = {}
+        for ident_id, ti in sft.trackIds.items():
+            if ti.group is None:
+                continue
+            for cam, t in ti.group.cam_track:
+                ct_to_id[(cam, t)] = ident_id
+        for t, cam, pts in sft.instance_list:
+            if cam not in pred_by_cam:
+                continue
+            ident_id = ct_to_id.get((cam, t))
+            if ident_id is None:
+                continue
+            cent = np.nanmean(pts, axis=0)
+            if np.isnan(cent).any():
+                continue
+            pred_by_cam[cam].setdefault(sft.frame_idx, {})[ident_id] = cent
+
+    # Per-cam motmetrics → SWITCH events.
+    mh = mm.metrics.create()
+    switches_by_frame: dict[int, list[dict]] = {}
+    per_cam_metrics: dict[str, dict] = {}
+
+    for cam in cameras:
+        acc = mm.MOTAccumulator(auto_id=False)
+        gt_cents = gt_centroids_by_cam[cam]
+        n_gt_frames = gt_cents.shape[0]
+
+        for sft in frames:
+            fi = sft.frame_idx
+            if fi < n_gt_frames:
+                fg = gt_cents[fi]
+                gt_ids = [i for i in range(fg.shape[0]) if not np.isnan(fg[i]).any()]
+                gt_pts = np.array([fg[i] for i in gt_ids]) if gt_ids else np.empty((0, 2))
+            else:
+                gt_ids, gt_pts = [], np.empty((0, 2))
+
+            pred_dict = pred_by_cam[cam].get(fi, {})
+            pred_ids = list(pred_dict.keys())
+            pred_pts = (np.array([pred_dict[i] for i in pred_ids])
+                        if pred_ids else np.empty((0, 2)))
+
+            if gt_pts.size and pred_pts.size:
+                dists = mm.distances.norm2squared_matrix(
+                    gt_pts, pred_pts, max_d2=max_distance ** 2,
+                )
+            else:
+                dists = np.empty((len(gt_ids), len(pred_ids)))
+
+            acc.update(gt_ids, pred_ids, dists, frameid=fi)
+
+        ev = acc.events
+        sw = ev[ev["Type"] == "SWITCH"]
+        for (frame_idx, _event_idx), row in sw.iterrows():
+            switches_by_frame.setdefault(int(frame_idx), []).append({
+                "cam": cam,
+                "gt_id": int(row["OId"]),
+                "pred_id": int(row["HId"]),
+            })
+
+        if return_metrics:
+            s = mh.compute(acc, metrics=[
+                "idf1", "idp", "idr", "mota", "num_switches",
+                "recall", "precision",
+            ], name=cam)
+            per_cam_metrics[cam] = {
+                "idf1": float(s.idf1.iloc[0]),
+                "idp":  float(s.idp.iloc[0]),
+                "idr":  float(s.idr.iloc[0]),
+                "mota": float(s.mota.iloc[0]),
+                "switches":  int(s.num_switches.iloc[0]),
+                "recall":    float(s.recall.iloc[0]),
+                "precision": float(s.precision.iloc[0]),
+            }
+
+    n_switches = sum(len(v) for v in switches_by_frame.values())
+    if return_metrics:
+        return n_switches, switches_by_frame, per_cam_metrics
+    return n_switches, switches_by_frame
