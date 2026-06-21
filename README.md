@@ -1,5 +1,12 @@
 # lucid_lite
 
+
+# Tracker Versions
+
+* 1.0 - Working tracker; forces *N* id's throughout the entire tracking
+* 1.0 - **Non-Working** tracker. Did not force *n* id constraint (for multiframe occlusions)
+
+
 Multi-view pose tracking GUI plus a triangulation-based identity tracker.
 See [`gui_source/README.md`](gui_source/README.md) for the GUI internals.
 
