@@ -33,7 +33,7 @@ def homogenize(arr):
     if arr.ndim == 1:
         return np.concatenate([arr, [1]]).reshape(-1, 1)
     
-    if arr.ndim == 2 and arr.shape[-1] == 2:
+    if arr.ndim == 2 and arr.shape[-1] in (2, 3):
         return np.hstack([arr, np.ones((arr.shape[0], 1))])
 
     raise AssertionError
@@ -169,6 +169,9 @@ def triangulate_group(group: dict, cam_map, cache, get_reprojections=False):
 
 
 def reproject_points(X, P):
+    if X.shape[1] == 3:
+        X = homogenize(X)
+
     assert P.shape == (3, 4)
     assert X.shape[1] == 4
     reprojs = P @ X.T # shape 3, n_nodes

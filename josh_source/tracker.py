@@ -30,6 +30,92 @@ def qimg_to_np(qimg: QImage):
     return arr.reshape(h, w, 3).copy() 
 
 
+
+def _deprecated_get_matches(costs, TEMPORAL_THRESHOLD):
+    
+    curr_groups_num = costs.shape[0]
+    prev_groups_num = costs.shape[1]
+
+
+    if curr_groups_num == 0 or prev_groups_num == 0:
+        # return null values
+        costs = None
+        valid_matches = np.empty((0, 2), dtype=int)
+        unmatched_curr = np.arange(curr_groups_num)
+        unmatched_prev = np.arange(prev_groups_num)
+        
+        return costs, valid_matches, unmatched_curr, unmatched_prev
+
+
+    # first: assign best matches - matches that are minumum in BOTH their respective column and row
+    row_mins = np.argmin(costs, axis=1)
+    col_mins = np.argmin(costs, axis=0)
+    best_match_rows = np.where(col_mins[row_mins] == np.arange(costs.shape[0]))[0]
+    best_match_cols = row_mins[best_match_rows]
+    mutual_matches = np.column_stack((best_match_rows, best_match_cols))
+
+
+    # second: assign remaining 'non' mutual matches with hungarian as long as they are above
+    remaining_r = np.setdiff1d(np.arange(costs.shape[0]), best_match_rows)
+    remaining_c = np.setdiff1d(np.arange(costs.shape[1]), best_match_cols)
+    submatrix = costs[np.ix_(remaining_r, remaining_c)]
+    
+    # run hungarian on suboptimal-matrix
+    local_r, local_c = linear_sum_assignment(submatrix)
+    global_r = remaining_r[local_r]
+    global_c = remaining_c[local_c]
+    hungarian_matches = np.column_stack((global_r, global_c))
+    
+    # get all matches but prune out ones above temporal threshold
+    all_matches = np.vstack((mutual_matches, hungarian_matches))
+    if len(all_matches) > 0:
+        match_costs = costs[all_matches[:, 0], all_matches[:, 1]]
+        valid_matches = all_matches[match_costs <= TEMPORAL_THRESHOLD]
+    else:
+        valid_matches = np.empty((0, 2), dtype=int)
+
+    # get unmatched curr/prev ids
+    unmatched_curr = np.setdiff1d(np.arange(curr_groups_num),  valid_matches[:, 0])
+    unmatched_prev = np.setdiff1d(np.arange(prev_groups_num),  valid_matches[:, 1])
+
+    return valid_matches, unmatched_curr, unmatched_prev
+
+
+def get_matches(costs:np.ndarray, TEMPORAL_THRESHOLD: float) -> tuple:
+
+    curr_groups_num = costs.shape[0]
+    prev_groups_num = costs.shape[1]
+
+    if curr_groups_num == 0 or prev_groups_num == 0:
+        return (
+            np.empty((0, 2), dtype=int), # valid_matches   
+            np.empty((0, 2), dtype=int), # ambig
+            np.arange(curr_groups_num),  # unmatched_curr
+            np.arange(prev_groups_num),  # unmatched_prev
+        )
+
+
+    valid_mask = (costs <= TEMPORAL_THRESHOLD)
+    row_valid = valid_mask.sum(axis=1)
+    col_valid = valid_mask.sum(axis=0)
+    
+    # get the matching indices - one correct per row
+    valid_indices = valid_mask & (row_valid[:, np.newaxis] == 1) & (col_valid[np.newaxis, :] == 1)
+    # get ambiguous indices
+    ambiguous_indices = valid_mask & ((row_valid[:, np.newaxis] > 1) | (col_valid[np.newaxis, :] > 1))
+
+    valid_matches = np.column_stack(np.where(valid_indices))
+    ambig_matches = np.column_stack(np.where(ambiguous_indices))
+
+    # get unmatched indices
+    unmatched_curr = np.where(row_valid == 0)[0]
+    unmatched_prev = np.where(col_valid == 0)[0]
+    
+    return (valid_matches, ambig_matches, unmatched_curr, unmatched_prev)
+
+
+
+
 @dataclass
 class ProjCache:
     '''
@@ -84,7 +170,7 @@ class Group:
     def __init__(self, group, instance_list, cam_map, proj_cache):
 
         self.id = None
-        self.valid, self.cams_by_count, self.points_by_cam, self.cam_track = self.is_valid(
+        self.valid, self.points_by_cam = self.is_valid(
             group=group,
             instance_list=instance_list,
             return_dict=True
@@ -111,7 +197,7 @@ class Group:
     def _calc_reprojs(self, reprojs) -> dict[str, float]:
 
         reproj_score = {}
-        for cam in self.cams_by_count:
+        for cam in self.points_by_cam:
             reproj_score[cam] = instance_pixel_distance(reprojs[cam], self.points_by_cam[cam][0])
 
         
@@ -124,16 +210,17 @@ class Group:
         checks validity of group
         '''
 
-        cams_by_count = defaultdict(int)
-        cam_track = []
+        # cams_by_count = defaultdict(int)
+        # cam_track = []
         points_by_cam = {}
         isvalid = True
-        for instance_idx in group:
-            track_idx, cam, pts = instance_list[instance_idx]
+
+        print(group)
+        for cam, pts in group:
 
             # store cam information
-            cams_by_count[cam] += 1
-            cam_track.append((cam, track_idx)) 
+            # cams_by_count[cam] += 1
+            # cam_track.append((cam, track_idx)) 
 
             # add points to dictionary
             if cam in points_by_cam:
@@ -143,7 +230,8 @@ class Group:
                 points_by_cam[cam] = [pts]
 
         if return_dict:
-            return isvalid, cams_by_count, points_by_cam, cam_track
+            # return isvalid, cams_by_count, points_by_cam, cam_track
+            return isvalid, points_by_cam
         else:
             return isvalid
 
@@ -222,7 +310,7 @@ class SingleFrameTrack:
         instance_by_cam, inst_list = self.get_instances(fg)
 
         self.n_insts = len(inst_list)
-        self.instance_by_cam: dict[str, tuple[int, np.ndarray]] = instance_by_cam
+        self.instance_by_cam: dict[str, list[tuple[int, np.ndarray]]] = instance_by_cam
         # key: cam name
         # value: (instance_count:int, points: np.ndarray)
 
@@ -379,44 +467,6 @@ class SingleFrameTrack:
         return edges
 
 
-    def _run_bfs(self):
-        
-        visited = np.zeros(self.n_insts, dtype=bool)
-
-        groups = []
-        while not np.all(visited):
-
-            unvisited = np.where(~visited)[0][0]
-            explored = [unvisited]
-            visited[unvisited] = True
-            
-            group = []
-
-            # run bfs on subgraphs
-            while explored:
-                vertex = explored.pop(0)
-                group.append(int(vertex))
-
-                for neighbor in np.where(self.adjacency_matrix[vertex] != np.inf)[0]:
-                    if not visited[neighbor]:    
-                        # print(f'vertex {vertex} has neighbors {}')
-                        visited[neighbor] = True
-                        explored.append(neighbor)
-
-            if len(group) < 2:
-                for v in group: self.nonmatch_instances.append(self.instance_list[v])
-                continue
-
-            # valid = Group.is_valid(group=group, instance_list=self.instance_list)
-
-            # if valid or :
-            groups.append(Group(group, self.instance_list, len(groups), self.cam_map, self.proj_cache))
-            
-
-
-        return groups
-
-
     def _run_union_find(self):
 
             n_nodes = self.adjacency_matrix.shape[0]
@@ -471,12 +521,18 @@ class SingleFrameTrack:
             # check validity of groups
             groups: list[Group] = []
             for group in list(distinct_groups.values()):
+
                 if len(group) < 2:
                     for v in group: self.nonmatch_instances.append(self.instance_list[v])    
-                elif Group.is_valid(group, self.instance_list):
-                    groups.append(Group(group, self.instance_list, self.cam_map, self.proj_cache))
+                    continue
+
+                elif len(group) == len(set([self.instance_list[v][1] for v in group])):
+                    # valid group
+
+                    g = [(self.instance_list[v][1], self.instance_list[v][2]) for v in group]
+                    groups.append(Group(g, self.instance_list, self.cam_map, self.proj_cache))
                 else:
-                    # group itself is 
+                    # group is invalid (multiple instances from the same camera)
                     fixed_groups = self._fix_group(group)
                     for fixed_group in fixed_groups:
                         if len(fixed_group) < 2:
@@ -537,6 +593,21 @@ class SingleFrameTrack:
         return list(distinct_groups.values())
 
 
+    def calc_reproj_distance(self, x, y):
+        '''
+            Returns L2 norm between two points
+        '''
+
+
+        assert x.shape == y.shape
+
+        error = np.nanmean(
+            np.linalg.norm(x - y,axis=1,)
+        )
+
+        return error
+
+
     def _init_identities(self):
         
         if not self.max_ids:
@@ -560,6 +631,135 @@ class SingleFrameTrack:
 
 
     def _match_prev_groups(self):
+        '''
+        temporal -> spatial
+            1. match each instance in the view with one of the ID's in the previous frame
+                If the error > threshold, then make a new ID
+            2. If there is only 
+        '''
+
+        # temporal matching
+        self.temporal_cost_by_cam: dict[str, np.ndarray] = {}
+        self.matches_by_cam: dict[str, tuple] = {}
+        for cam in self.instance_by_cam:
+
+            temporal_cost, matches = self._temporal_matching(cam)
+            self.temporal_cost_by_cam[cam] = temporal_cost
+
+
+            self.matches_by_cam[cam] = matches
+
+
+        # spatial matching
+        self.spatial_matches = self._spatial_matching()
+        # return {}
+
+        # make current tracks
+        trackIds = {}
+        for id_, cam_points in self.spatial_matches.items():
+            group = Group(
+                group = cam_points,
+                instance_list=self.instance_list,
+                cam_map=self.cam_map,
+                proj_cache=self.proj_cache
+            )
+            trackIds[id_] = TrackedIdentity(
+                id = id_,
+                group = group,
+                last_points3d=group.points3d,
+            )
+
+
+        return trackIds
+    
+
+
+    def _temporal_matching(self, cam: str):
+        '''
+        Matches ID's of current `cam` instances to previous IDs
+        '''
+        
+        num_prev_tracks = len(self.prev_trackIds.values())
+
+        # get camera instances and P matrix
+        cam_instances = self.instance_by_cam[cam]
+        P = self.proj_cache.getP(self.cam_map[cam])
+
+        # define temporal cost matrix
+        temporal_cost = np.full((len(cam_instances), num_prev_tracks), np.inf)
+
+        # converts row index -> ID number for prev tracks
+        prev_track_id = []
+        
+        # loop over all the prev tracks
+        for j, prev_track in enumerate(self.prev_trackIds.values()):
+            prev_track_id.append(prev_track.id)
+
+            prev_track_reproj = dehomogenize(reproject_points(prev_track.last_points3d, P))
+
+            for i in range(len(cam_instances)):
+                temporal_cost[i, j] = self.calc_reproj_distance(cam_instances[i][1], prev_track_reproj)
+
+
+        matches = get_matches(temporal_cost, self.TEMPORAL_THRESHOLD)
+
+        # update all prev_indicies to id indices
+        prev_track_id = np.array(prev_track_id, dtype=int)
+        valid_matches  = matches[0]
+        ambig_matches  = matches[1]
+        unmatched_curr = matches[2]
+        unmatched_prev = matches[3]
+        valid_matches[:, 1]  = prev_track_id[valid_matches[:, 1]]
+        ambig_matches[:, 1]  = prev_track_id[ambig_matches[:, 1]]
+        unmatched_prev = prev_track_id[unmatched_prev]
+
+
+        return temporal_cost, (valid_matches, ambig_matches, unmatched_curr, unmatched_prev)
+
+        
+    def _spatial_matching(self):
+        '''
+        Matches instances across space (different views)
+        '''
+
+        spatial_matches: dict[int, list[tuple[str, np.ndarray]]] = defaultdict(list)
+        hidden_ids: set = set()
+
+        self.unmatched_currs = []
+
+        # first, group ID's that are verified in call cameras
+        for cam, matches in self.matches_by_cam.items():
+            valid_matches  = matches[0]
+            ambig_matches  = matches[1]
+            unmatched_curr = matches[2]
+            unmatched_prev = matches[3]
+
+            for curr_idx, id_ in valid_matches:
+                inst = self.instance_by_cam[cam][curr_idx][1]
+
+                spatial_matches[id_].append((cam, inst))
+
+            for p in unmatched_prev:
+                hidden_ids.add(p)
+
+            for c in unmatched_curr:
+                self.unmatched_currs.append(c)
+
+        return spatial_matches
+
+        
+
+            
+            
+
+
+
+
+
+
+        
+    
+    def _deprecated_match_prev_groups(self):
 
         '''
         Matches current group assignment to prev frame groups
@@ -567,71 +767,6 @@ class SingleFrameTrack:
         '''
 
         matchable_ids =  [i for i, p in self.prev_trackIds.items() if p.frames_hidden < self.FRAMES_MISSING_THRESHOLD]
-
-        def _get_matches():
-            assert self.groups is not None
-            
-            curr_groups_num = len(self.groups)
-            prev_groups_num = len(matchable_ids)
-
-
-            if len(matchable_ids) == 0 or curr_groups_num == 0:
-                # return null values
-                costs = None
-                valid_matches = np.empty((0, 2), dtype=int)
-                unmatched_curr = np.arange(curr_groups_num)
-                unmatched_prev = np.arange(prev_groups_num)
-                
-                return costs, valid_matches, unmatched_curr, unmatched_prev
-
-
-            # populate the cost matrix
-            costs = np.full((curr_groups_num, len(matchable_ids)), np.inf)
-            for col, id_ in enumerate(matchable_ids):
-                for row in range(curr_groups_num):
-                    
-                    # print(self.groups[row].points3d)
-                    assert self.groups[row].points3d is not None
-                    last = self.prev_trackIds[id_].last_points3d
-
-                    costs[row, col] = np.nanmean(
-                        np.linalg.norm(
-                            self.groups[row].points3d-last,
-                            axis=1,
-                        )
-                    )
-
-            # first: assign best matches - matches that are minumum in BOTH their respective column and row
-            row_mins = np.argmin(costs, axis=1)
-            col_mins = np.argmin(costs, axis=0)
-            best_match_rows = np.where(col_mins[row_mins] == np.arange(costs.shape[0]))[0]
-            best_match_cols = row_mins[best_match_rows]
-            mutual_matches = np.column_stack((best_match_rows, best_match_cols))
-
-            # second: assign remaining 'non' mutual matches with hungarian as long as they are above
-            remaining_r = np.setdiff1d(np.arange(costs.shape[0]), best_match_rows)
-            remaining_c = np.setdiff1d(np.arange(costs.shape[1]), best_match_cols)
-            submatrix = costs[np.ix_(remaining_r, remaining_c)]
-            
-            # run hungarian on suboptimal-matrix
-            local_r, local_c = linear_sum_assignment(submatrix)
-            global_r = remaining_r[local_r]
-            global_c = remaining_c[local_c]
-            hungarian_matches = np.column_stack((global_r, global_c))
-            
-            # get all matches but prune out ones above temporal threshold
-            all_matches = np.vstack((mutual_matches, hungarian_matches))
-            if len(all_matches) > 0:
-                match_costs = costs[all_matches[:, 0], all_matches[:, 1]]
-                valid_matches = all_matches[match_costs <= self.TEMPORAL_THRESHOLD]
-            else:
-                valid_matches = np.empty((0, 2), dtype=int)
-
-            # get unmatched curr/prev ids
-            unmatched_curr = np.setdiff1d(np.arange(curr_groups_num),  valid_matches[:, 0])
-            unmatched_prev = np.setdiff1d(np.arange(prev_groups_num),  valid_matches[:, 1])
-
-            return costs, valid_matches, unmatched_curr, unmatched_prev
 
             
         def _assign_ids(valid_matches, unmatched_curr, unmatched_prev):
@@ -913,13 +1048,24 @@ class MultiFrameTrack:
 
         with self.session.batch_updates():
             for sft in self.frames:
+                # Group no longer stores cam_track. The point arrays held in
+                # group.points_by_cam are the same objects as in instance_list,
+                # so map each array back to its (cam, track_idx) by identity.
+                pts_to_track: dict[int, tuple[str, int]] = {
+                    id(pts): (cam_name, track_idx)
+                    for track_idx, cam_name, pts in sft.instance_list
+                }
+
                 assignments: dict[tuple[str, int], int] = {}
                 if sft.trackIds is not None:
                     for ident_id, ti in sft.trackIds.items():
                         if ti.group is None:
                             continue
-                        for cam, track in ti.group.cam_track:
-                            assignments[(cam, track)] = ident_id
+                        for pts_list in ti.group.points_by_cam.values():
+                            for pts in pts_list:
+                                key = pts_to_track.get(id(pts))
+                                if key is not None:
+                                    assignments[key] = ident_id
 
                 # 3. Snapshot every visible (cam, track) at this frame so we know which
                 #    instances need the -1 sentinel (didn't land in any group).
