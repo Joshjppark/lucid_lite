@@ -7,6 +7,7 @@ uv.lock
 /benchmark
 /other_trackers
 /prompts
+/tracker_testing
 
 .prompts/
 .claude/

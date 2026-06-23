@@ -29,52 +29,104 @@ def qimg_to_np(qimg: QImage):
     return arr.reshape(h, w, 3).copy() 
 
 
-def get_matches(costs:np.ndarray, TEMPORAL_THRESHOLD: float, prev_track_id) -> tuple:
+def get_matches(costs: np.ndarray, THRESH_LOW: float, THRESH_HIGH: float,
+                prev_track_id, frames_hidden=None, alpha: float = 0.0) -> tuple:
+    '''
+    Two-level probabilistic temporal matcher.
 
-    curr_groups_num = costs.shape[0]
-    prev_groups_num = costs.shape[1]
+    Returns the SAME 5-bucket schema get_matches has always returned
+    (valid_match, ambig_curr, ambig_prev, unmatched_curr, unmatched_prev), so
+    every downstream consumer (SpatialMatches.add_camera_match and the
+    resolvers) is unchanged -- only the boundaries between buckets are now
+    probability-derived.
 
-    if curr_groups_num == 0 or prev_groups_num == 0:
+    Params:
+      costs: (n_curr, n_prev) scale-normalized reproj distances (unitless,
+             np.inf where unset). Lower = better match.
+      THRESH_LOW:  high-confidence accept gate. A curr whose best candidate is
+                   < LOW and is the unique high-confidence candidate in its row
+                   and column is accepted outright (valid_match).
+      THRESH_HIGH: reject-for-match gate. Candidates with cost < HIGH are
+                   "plausible"; >= HIGH is a spawn proposal (unmatched_curr).
+                   LOW <= cost < HIGH is "medium" -> deferred to the cross-cam
+                   resolver via ambig_curr.
+      frames_hidden: (n_prev,) consecutive-unseen counts in prev_track_id
+                   column order. Used to widen the gates for long-hidden ids.
+      alpha: per-hidden-frame gate inflation. Effective gate for prev id j is
+             base * (1 + alpha * frames_hidden[j]) -- equivalently a Gaussian
+             match-likelihood exp(-cost^2 / 2 sigma_j^2) with sigma_j growing
+             linearly in frames_hidden (sigma0 folded into the gate values).
+    '''
+    n_curr, n_prev = costs.shape
+
+    if n_curr == 0 or n_prev == 0:
+        # No currs (nothing to assign) or no prev ids (everything is new):
+        # every curr is a spawn proposal with no available prev id; every prev
+        # id is unmatched in this cam.
+        prev_ids = np.asarray(prev_track_id, dtype=int)
         return (
-            np.empty((0, 2), dtype=int), # valid_matches   
-            [(), ()],                    # ambig_curr
-            [],                          # ambig_prev
-            np.arange(curr_groups_num),  # unmatched_curr
-            np.arange(prev_groups_num),  # unmatched_prev
+            np.empty((0, 2), dtype=int),                  # valid_match
+            [],                                           # ambig_curr
+            [],                                           # ambig_prev
+            (np.arange(n_curr), prev_ids),                # unmatched_curr (2-tuple!)
+            prev_ids,                                     # unmatched_prev
         )
 
-    valid_mask = (costs <= TEMPORAL_THRESHOLD)
-    row_sum = valid_mask.sum(axis=1)
-    col_sum = valid_mask.sum(axis=0)
+    # Per-prev-id gate inflation from the sigma model.
+    if frames_hidden is None:
+        fh = np.zeros(n_prev)
+    else:
+        fh = np.asarray(frames_hidden, dtype=float)
+    inflate = 1.0 + alpha * fh                            # (n_prev,)
+    low_row = (THRESH_LOW * inflate)[np.newaxis, :]
+    high_row = (THRESH_HIGH * inflate)[np.newaxis, :]
 
-    r, c = np.where(valid_mask)
+    accept_mask = costs <= low_row                        # high confidence
+    cand_mask = costs <= high_row                         # plausible (match-or-defer)
 
-    # get the matching indices - one correct per row
-    valid_indices = valid_mask & (row_sum[:, np.newaxis] == 1) & (col_sum[np.newaxis, :] == 1)
-    valid_match = np.column_stack(np.where(valid_indices))
-    valid_match[:, 1]  = prev_track_id[valid_match[:, 1]]
+    # valid: a high-confidence pair that is the UNIQUE high-confidence candidate
+    # in both its row and column (a medium runner-up does not spoil it).
+    a_row = accept_mask.sum(axis=1)
+    a_col = accept_mask.sum(axis=0)
+    valid_indices = accept_mask & (a_row[:, None] == 1) & (a_col[None, :] == 1)
+    vr, vc = np.where(valid_indices)                      # col INDEX space (pre-remap)
 
-    # get unmatched indices
+    valid_match = np.column_stack((vr, prev_track_id[vc])) if vr.size \
+        else np.empty((0, 2), dtype=int)
+
+    # Plausible pairs that aren't clean valid matches need resolving. Suppress
+    # rows already validly matched (curr is taken) and columns already validly
+    # claimed (one instance per cam per id).
+    ambig_indices = cand_mask & ~valid_indices
+    ambig_indices[vr, :] = False
+    ambig_indices[:, vc] = False
+
+    # unmatched currs: rows with no plausible candidate -> spawn proposal.
+    # available prev ids = ids no curr plausibly matched (empty column).
+    cand_col = cand_mask.sum(axis=0)
     unmatched_curr = (
-        np.where(row_sum == 0)[0], # unmatched current track idx
-        prev_track_id[np.where(col_sum < 1)[0]],    # available IDs in given assignment
+        np.where(cand_mask.sum(axis=1) == 0)[0],
+        prev_track_id[np.where(cand_col < 1)[0]],
     )
-    unmatched_prev = np.where(col_sum == 0)[0]
-    unmatched_prev = prev_track_id[unmatched_prev]
+    unmatched_prev = prev_track_id[np.where(cand_col == 0)[0]]
 
-    # get ambiguous indices
-    ambig_indices = valid_mask & ~valid_indices
-    ambig_cols = np.where(ambig_indices.sum(axis=0) > 1)[0]
-    ambig_rows = np.where(ambig_indices.sum(axis=1) > 1)[0]
     ambig_curr = []
     ambig_prev = []
 
-    for c in ambig_cols:
+    # column contention (one prev id plausibly pulled by multiple currs)
+    for c in np.where(ambig_indices.sum(axis=0) > 1)[0]:
         ambig_prev.append([(int(r), int(prev_track_id[c])) for r in np.where(ambig_indices[:, c])[0]])
 
-    for r in ambig_rows:
+    # row contention (one curr plausibly matching multiple prev ids)
+    for r in np.where(ambig_indices.sum(axis=1) > 1)[0]:
         ambig_curr.append([(int(r), int(prev_track_id[c])) for c in np.where(ambig_indices[r, :])[0]])
 
+    # medium-but-unique rows: a single plausible candidate that is not high
+    # confidence. Not "ambiguous" by count, but must still be verified by the
+    # cross-cam resolver rather than accepted outright -> route to ambig_curr.
+    for r in np.where(ambig_indices.sum(axis=1) == 1)[0]:
+        c = int(np.where(ambig_indices[r, :])[0][0])
+        ambig_curr.append([(int(r), int(prev_track_id[c]))])
 
     return (valid_match, ambig_curr, ambig_prev, unmatched_curr, unmatched_prev)
 
@@ -209,9 +261,13 @@ class Group:
 
         reproj_score = {}
         for cam in self.points_by_cam:
-            reproj_score[cam] = instance_pixel_distance(reprojs[cam], self.points_by_cam[cam])
+            # Normalize by the group's reprojected apparent scale in this cam so
+            # the score is a unitless fraction of body length (depth-invariant).
+            ref = apparent_scale(dehomogenize(reprojs[cam]))
+            reproj_score[cam] = instance_pixel_distance(
+                reprojs[cam], self.points_by_cam[cam], ref_scale=ref)
 
-        
+
         return reproj_score
     
         
@@ -280,11 +336,36 @@ class SingleFrameTrack:
         self.cam_map = {c.name: c for c in self.cameras}
 
         # hyperparameters
-        self.EPIPOLE_THRESHOLD = 9
-        self.TEMPORAL_THRESHOLD = 90
-        self.FRAMES_MISSING_THRESHOLD = 10
-        self.MAX_POTENTIAL_REPROJ_THRESHOLD = 20
+        # All distance thresholds are now UNITLESS fractions of body length
+        # (pixel error / apparent instance scale), not raw pixels. The old
+        # pixel values are noted for reference; converted by S_rep ~= 30px.
+        # Measured instance RMS spread on this set is ~82 px (not 30), so the
+        # px->unitless divisor is ~82: EPIPOLE 9/82~=0.11, TEMPORAL 90/82~=1.1,
+        # MAX_POTENTIAL 20/82~=0.24. Cost histograms are cleanly bimodal:
+        # epipolar true matches <0.06, noise >1.0; best temporal match p50=0.52.
+        self.EPIPOLE_THRESHOLD = 0.15            # was 9 px
+        self.MAX_POTENTIAL_REPROJ_THRESHOLD = 0.25   # was 20 px
+        # Keep this SHORT. Hidden ids reproject from a STALE 3D prior (no
+        # velocity model yet, review §4.3); coasting them longer lets them
+        # intercept current instances into the ambiguous bucket and starve
+        # leftover-spawn -> tracking collapses. 10 lets dead ids clear quickly.
+        self.FRAMES_MISSING_THRESHOLD = 10       # frames
         self.MIN_NODES = 3
+
+        # Two-level probabilistic temporal gates (replace TEMPORAL_THRESHOLD=90px).
+        #   cost < THRESH_LOW  & unambiguous -> accept (valid match)
+        #   THRESH_LOW <= cost < THRESH_HIGH -> defer to cross-cam resolver
+        #   cost >= THRESH_HIGH              -> spawn proposal (unmatched curr)
+        # HIDDEN_INFLATION_ALPHA widens both gates for long-hidden ids:
+        # effective gate = base * (1 + alpha * frames_hidden), the Gaussian
+        # match-likelihood exp(-cost^2 / 2 sigma^2) with sigma ~ (1+alpha*fh).
+        # THRESH_LOW must be TIGHT: a loose accept gate makes many prev ids
+        # fall below it per curr, so uniqueness (the seed for valid groups)
+        # fails and everything becomes ambiguous. Best-match p25~=0.17, p50~=0.52
+        # -> 0.5 keeps the clear matches unique while deferring the rest.
+        self.THRESH_LOW = 0.5                    # high-confidence accept
+        self.THRESH_HIGH = 1.1                   # plausible (was TEMPORAL=90 px)
+        self.HIDDEN_INFLATION_ALPHA = 0.1
 
         # save instances to dict and list
         instance_by_cam, inst_list = self.get_instances(fg)
@@ -443,7 +524,11 @@ class SingleFrameTrack:
             for idx2, (_, cam2_pt) in enumerate(cam2_points):
 
                 F = self.proj_cache.getF(cam1, cam2)
-                edges[idx1, idx2] = calc_epipolar_score(cam1_pt, cam2_pt, F, self.node_weights)
+                # Symmetric scale ref (geometric mean of the pair) keeps the
+                # normalized score symmetric under getF direction flips.
+                ref = np.sqrt(apparent_scale(cam1_pt) * apparent_scale(cam2_pt))
+                edges[idx1, idx2] = calc_epipolar_score(
+                    cam1_pt, cam2_pt, F, self.node_weights, ref_scale=ref)
 
         return edges
 
@@ -574,9 +659,11 @@ class SingleFrameTrack:
         return list(distinct_groups.values())
 
 
-    def calc_reproj_distance(self, x, y):
+    def calc_reproj_distance(self, x, y, ref_scale=1.0):
         '''
-            Returns L2 norm between two points
+            Returns scale-normalized mean L2 between two instances (unitless).
+            ref_scale divides out apparent instance size; default 1.0 keeps
+            the original raw-pixel behavior.
         '''
 
 
@@ -586,7 +673,7 @@ class SingleFrameTrack:
             np.linalg.norm(x - y,axis=1,)
         )
 
-        return error
+        return error / ref_scale
 
 
     def _init_identities(self):
@@ -656,20 +743,31 @@ class SingleFrameTrack:
 
         # converts row index -> ID number for prev tracks
         prev_track_id = []
-        
+        # consecutive-unseen counts, aligned to the columns of temporal_cost
+        frames_hidden = []
+
         # loop over all the prev tracks
         for j, prev_track in enumerate(self.prev_trackIds.values()):
             # save id of the prev track
             prev_track_id.append(prev_track.id)
+            frames_hidden.append(prev_track.frames_hidden)
 
             # get reproj of prev track
             prev_track_reproj = dehomogenize(reproject_points(prev_track.last_points3d, P))
 
+            # normalize each curr-vs-prev distance by the (stable) reprojected
+            # prev instance's apparent scale -> unitless, depth-invariant cost.
+            ref = apparent_scale(prev_track_reproj)
             for i in range(len(cam_instances)):
-                temporal_cost[i, j] = self.calc_reproj_distance(cam_instances[i][1], prev_track_reproj)
+                temporal_cost[i, j] = self.calc_reproj_distance(
+                    cam_instances[i][1], prev_track_reproj, ref_scale=ref)
 
         prev_track_id = np.array(prev_track_id, dtype=int)
-        matches = get_matches(temporal_cost, self.TEMPORAL_THRESHOLD, prev_track_id)
+        frames_hidden = np.array(frames_hidden, dtype=float)
+        matches = get_matches(
+            temporal_cost, self.THRESH_LOW, self.THRESH_HIGH, prev_track_id,
+            frames_hidden=frames_hidden, alpha=self.HIDDEN_INFLATION_ALPHA,
+        )
 
         return temporal_cost, matches
 
@@ -724,19 +822,21 @@ class SingleFrameTrack:
         # now make the TrackedIdentity() objects
         trackIds = {}
 
-        # hidden IDs
+        # hidden IDs (§3.4 fix: key on hidden_id, not stale id_/group from the
+        # valid_matches loop above; carry a fresh group=None hidden identity).
         for hidden_id in hidden_ids:
             prev_track = self.prev_trackIds[hidden_id]
             if prev_track.frames_hidden >= self.FRAMES_MISSING_THRESHOLD:
                 # track has been 'hidden' for too long; stop propagating it
-                cam_points = list(prev_track.group.points_by_cam.items())
-                self.nonmatch_instances.extend(cam_points)
+                if prev_track.group is not None:
+                    cam_points = list(prev_track.group.points_by_cam.items())
+                    self.nonmatch_instances.extend(cam_points)
                 continue
 
-            # make 'hidden' TrackedIdentity
-            trackIds[id_] = TrackedIdentity(
-                id = id_,
-                group=group,
+            # make 'hidden' TrackedIdentity (no detection this frame -> group None)
+            trackIds[hidden_id] = TrackedIdentity(
+                id = hidden_id,
+                group=None,
                 last_points3d=prev_track.last_points3d,
                 frames_hidden=prev_track.frames_hidden + 1,
             )
@@ -822,29 +922,34 @@ class SingleFrameTrack:
 
             reproj_diff = {}
             for track_idx, id_ in points:
+                # §3.1.1: a candidate id with no group this frame can't be
+                # evaluated; and skip ids whose group already has this cam
+                # (would add a second instance from the same view).
+                if id_ not in self.groups_by_id:
+                    continue
                 if cam in self.groups_by_id[id_].points_by_cam:
-                    continue 
+                    continue
                 # extract the group and its original reprojection score
-                pot_group, pot_group_reproj_score, og_reproj_score = self._eval_potential_group(cam, track_idx, id_)    
-                reproj_diff[id_] = (pot_group, pot_group_reproj_score - og_reproj_score)
+                pot_group, pot_group_reproj_score, og_reproj_score = self._eval_potential_group(cam, track_idx, id_)
+                diff = pot_group_reproj_score - og_reproj_score
+                # §3.1.2: NaN never compares True, so it would make min()
+                # order-dependent -> drop non-finite candidates.
+                if not np.isfinite(diff):
+                    continue
+                reproj_diff[id_] = (pot_group, diff)
 
-                # print(track_idx, id_)
-                # print(f'og_reproj_score: {og_reproj_score}')
-                # print(f'reproj_diff: {potential_group_reproj_score}')
-            # the new group with the lowest reproj_diff (smallest change) gets the new instance
-            # the other instances are pooled into `unmatched prev`
+            # If nothing is assignable, every candidate id for this curr is
+            # released back to the hidden/unmatched-prev pool.
+            if not reproj_diff:
+                new_unmatched_prevs.extend([(cam, p[1]) for p in points])
+                continue
+
+            # the new group with the lowest reproj_diff (smallest change) gets
+            # the new instance; the other instances are pooled into unmatched_prev
             update_id = min(reproj_diff, key=lambda k: reproj_diff[k][1])
             self.groups_by_id[update_id] = reproj_diff[update_id][0] # new group at index 0
 
             new_unmatched_prevs.extend([(cam, p[1]) for p in points if p[1] != update_id])
-
-            # TODO: remove this
-            self.reproj_diff = reproj_diff
-            print(f'frame_idx: {self.frame_idx}')
-            print(f'reproj_diff: {self.reproj_diff}')
-            print(f'update_id: {update_id}')
-            print(f'ambig_currs: {ambig_currs}')
-            print(f'new_unmatched_prevs: {new_unmatched_prevs}')
 
         return new_unmatched_prevs
 
@@ -874,18 +979,23 @@ class SingleFrameTrack:
                 if pot_id not in self.groups_by_id:
                     continue
 
+                # §3.2.1 (mirror of §3.1.1): can't add a second instance from
+                # this same cam to a group that already has it.
+                if cam in self.groups_by_id[pot_id].points_by_cam:
+                    continue
+
                 pot_group, pot_score, og_score = self._eval_potential_group(cam, track_idx, pot_id)
-                
-                if pot_score - og_score < self.MAX_POTENTIAL_REPROJ_THRESHOLD:
-                    reproj_diff[pot_id] = (pot_group, pot_score - og_score)
+
+                diff = pot_score - og_score
+                # §3.2.5: NaN comparison is False (silently dropped); make the
+                # finite-only guard explicit so the polarity can't be flipped.
+                if np.isfinite(diff) and diff < self.MAX_POTENTIAL_REPROJ_THRESHOLD:
+                    reproj_diff[pot_id] = (pot_group, diff)
 
             if reproj_diff:
                 update_id = min(reproj_diff, key=lambda k: reproj_diff[k][1])
                 self.groups_by_id[update_id] = reproj_diff[update_id][0]
                 # TODO: remove `update_id` from any potential other unmatched_currs
-
-                print(unmatched_currs)
-                print(f'updated for cam {cam} track {track_idx} to id {update_id}')
             else:
                 # put the instance in the leftovers
                 leftovers.append((cam, track_idx))
